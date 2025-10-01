@@ -8,7 +8,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 
 APEX_KEY    = os.environ["APEX_KEY"]
 APEX_SECRET = os.environ["APEX_SECRET"].encode()
-BASE_URL    = os.environ.get("APEX_BASE_URL", "https://api.pro.apex.exchange")  # override in Render if needed
+BASE_URL    = os.environ.get("APEX_BASE_URL", "https://api.omni.apex.exchange")  # override in Render if needed
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 
 # requests session with retries & longer connect timeout
