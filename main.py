@@ -24,6 +24,40 @@ retry = Retry(
 session.mount("https://", HTTPAdapter(max_retries=retry))
 session.mount("http://", HTTPAdapter(max_retries=retry))
 
+def diag():
+    import socket
+    lines = []
+    try:
+        ip = session.get("https://api.ipify.org", timeout=(5,10)).text
+        lines.append(f"Outbound IP: `{ip}`")
+    except Exception as e:
+        lines.append(f"Outbound IP check failed: {e}")
+    try:
+        # DNS resolution
+        host = BASE_URL.split("://",1)[1].split("/",1)[0]
+        addrs = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+        lines.append(f"DNS {host} → {[a[4][0] for a in addrs]}")
+    except Exception as e:
+        lines.append(f"DNS failed: {e}")
+    try:
+        # Fast known-good https
+        session.get("https://www.google.com", timeout=(5,10))
+        lines.append("HTTPS to google.com: OK")
+    except Exception as e:
+        lines.append(f"HTTPS to google.com FAILED: {e}")
+    try:
+        session.get(BASE_URL + "/v1/ping", timeout=(10,10))  # if ping exists; otherwise expect timeout
+        lines.append(f"ApeX ping/url: {BASE_URL}/v1/ping OK")
+    except Exception as e:
+        lines.append(f"ApeX reachability FAILED: {e}")
+    post_to_discord(lines)
+
+if __name__ == "__main__":
+    logging.info("Starting worker. BASE_URL=%s", BASE_URL)
+    diag()  # <— add this
+    ...
+
+
 def sign(path, method, body=""):
     ts = str(int(time.time() * 1000))
     payload = ts + method + path + body
