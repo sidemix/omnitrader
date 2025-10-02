@@ -1,9 +1,10 @@
 # main.py — ApeX Omni → Discord (Render worker)
-# - Auto-negotiates APEX-TIMESTAMP style (ms/iso/s) and secret mode (raw/base64)
-# - Syncs server time (/v3/time) to remove clock skew
+# - Server time sync (+ latency cushion) to satisfy APEX-TIMESTAMP requirements
+# - Auto-negotiates timestamp style (iso -> ms -> s); rejects "TIMESTAMP"/"expired"/signature/auth errors
+# - Signs v3: HMAC key = Base64(secret-utf8), msg = ts + METHOD + path + dataString, sig = Base64(HMAC-SHA256)
 # - Surfaces API "code/msg"
-# - Recursively finds positions, filters zero-size
-# - Posts tidy Discord embeds only when positions change
+# - Recursively finds positions; filters zero-size
+# - Posts clean Discord embeds only when positions change
 
 import os
 import time
@@ -21,21 +22,21 @@ from urllib3.util.retry import Retry
 
 # ========= ENV =========
 APEX_KEY        = os.environ["APEX_KEY"]
-APEX_SECRET     = os.environ["APEX_SECRET"]            # string from Omni UI
+APEX_SECRET     = os.environ["APEX_SECRET"]            # raw secret string from Omni UI
 APEX_PASSPHRASE = os.environ["APEX_PASSPHRASE"]
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 
+# Omni mainnet by default. For testnet: https://testnet.omni.apex.exchange/api
 BASE_URL  = os.environ.get("APEX_BASE_URL", "https://omni.apex.exchange/api").rstrip("/")
+
+# Polling & posting behavior
 POLL_SECS = int(os.environ.get("POLL_INTERVAL_SECS", "10"))
 MIN_POST_INTERVAL_SECS = int(os.environ.get("MIN_POST_INTERVAL_SECS", "60"))
-POST_EMPTY_EVERY_SECS  = int(os.environ.get("POST_EMPTY_EVERY_SECS", "0"))
+POST_EMPTY_EVERY_SECS  = int(os.environ.get("POST_EMPTY_EVERY_SECS", "0"))    # 0 = only on transition
 DEBUG = os.environ.get("DEBUG", "0") == "1"
 
-# Optional hard overrides. If set, negotiation is skipped.
-FORCE_TS_STYLE = os.environ.get("APEX_TS_STYLE", "").lower()      # "", "ms", "iso", "s"
-FORCE_SECRET_B64 = os.environ.get("APEX_SECRET_BASE64", "")
-if FORCE_SECRET_B64 not in ("", "0", "1"):
-    FORCE_SECRET_B64 = ""  # sanitize
+# Optional preference for negotiation (leave blank to auto)
+FORCE_TS_STYLE = os.environ.get("APEX_TS_STYLE", "").lower()   # "", "iso", "ms", "s"
 
 # ========= LOGGING =========
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -52,8 +53,7 @@ retry = Retry(
 session.mount("https://", HTTPAdapter(max_retries=retry))
 
 # ========= Globals chosen by negotiation =========
-TS_STYLE_ACTIVE = "ms"           # one of: "ms", "iso", "s"
-SECRET_BASE64_ACTIVE = False     # True => use base64-decoded secret bytes; False => raw bytes
+TS_STYLE_ACTIVE = "iso"          # one of: "iso", "ms", "s" (we prefer ISO first)
 _server_offset_ms = 0            # server_ms - local_ms
 
 # ========= Discord helpers =========
@@ -113,9 +113,9 @@ def _parse_server_time_to_ms(payload: Dict[str, Any]) -> Optional[int]:
     # numeric seconds or ms
     try:
         val = float(cand)
-        if val > 1e12:
+        if val > 1e12:  # ms
             return int(val)
-        if val > 1e9:
+        if val > 1e9:   # seconds
             return int(val * 1000)
     except Exception:
         pass
@@ -156,7 +156,10 @@ def _ts_value(style: str) -> str:
     if now - _last_sync > 300:  # re-sync every 5 minutes
         sync_server_time()
         _last_sync = now
-    ms = int(time.time() * 1000) + _server_offset_ms
+
+    # base value from synced server time (+ small latency cushion)
+    ms = int(time.time() * 1000) + _server_offset_ms + 300
+
     if style == "iso":
         dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
         return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -171,15 +174,16 @@ def _data_string(data: Optional[Dict[str, Any]]) -> str:
     items = sorted((k, v) for k, v in data.items() if v is not None)
     return "&".join(f"{k}={v}" for k, v in items)
 
-def _sign_with(secret_b64: bool, ts: str, path: str, method: str, data: Optional[Dict[str, Any]]) -> str:
+def _sign(ts: str, path: str, method: str, data: Optional[Dict[str, Any]]) -> str:
+    # Official: key = Base64(secret-utf8)
+    key_bytes = base64.standard_b64encode(APEX_SECRET.encode("utf-8"))
     msg = ts + method.upper() + path + _data_string(data)
-    key_bytes = base64.b64decode(APEX_SECRET) if secret_b64 else APEX_SECRET.encode("utf-8")
     digest = hmac.new(key_bytes, msg=msg.encode("utf-8"), digestmod=hashlib.sha256).digest()
     return base64.standard_b64encode(digest).decode()
 
-def _headers(ts_style: str, secret_b64: bool, path: str, method: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+def _headers(ts_style: str, path: str, method: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
     ts = _ts_value(ts_style)
-    sig = _sign_with(secret_b64, ts, path, method, data)
+    sig = _sign(ts, path, method, data)
     return {
         "APEX-API-KEY": APEX_KEY,
         "APEX-PASSPHRASE": APEX_PASSPHRASE,
@@ -188,10 +192,10 @@ def _headers(ts_style: str, secret_b64: bool, path: str, method: str, data: Opti
         "Content-Type": "application/json",
     }
 
-# ========= Low-level GET with current combo =========
-def _get_with_combo(ts_style: str, secret_b64: bool, path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
+# ========= Low-level GET with chosen combo =========
+def _get_with_ts(ts_style: str, path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
     url = f"{BASE_URL}{path}"
-    hdrs = _headers(ts_style, secret_b64, path, "GET", None)
+    hdrs = _headers(ts_style, path, "GET", None)
     r = session.get(url, headers=hdrs, params=params, timeout=(20, 30))
     try:
         data = r.json()
@@ -199,60 +203,51 @@ def _get_with_combo(ts_style: str, secret_b64: bool, path: str, params: Optional
         data = {}
     return r.status_code, data
 
-# ========= Negotiation =========
 def _api_error_code_msg(data: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]]:
     return data.get("code"), data.get("msg")
 
-def negotiate_auth_combo() -> None:
-    global TS_STYLE_ACTIVE, SECRET_BASE64_ACTIVE
-    # Candidate orders
-    ts_candidates = []
-    if FORCE_TS_STYLE in ("ms", "iso", "s"):
-        ts_candidates = [FORCE_TS_STYLE]
-    ts_candidates += [s for s in ("ms", "iso", "s") if s not in ts_candidates]
+# ========= Negotiation (timestamp style) =========
+def negotiate_ts_style() -> None:
+    global TS_STYLE_ACTIVE
+    ts_candidates: List[str] = []
+    if FORCE_TS_STYLE in ("iso", "ms", "s"):
+        ts_candidates.append(FORCE_TS_STYLE)
+    # prefer iso first
+    for s in ("iso", "ms", "s"):
+        if s not in ts_candidates:
+            ts_candidates.append(s)
 
-    secret_candidates = []
-    if FORCE_SECRET_B64 in ("0", "1"):
-        secret_candidates = [FORCE_SECRET_B64 == "1"]
-    secret_candidates += [s for s in (False, True) if (FORCE_SECRET_B64 == "" or (s != (FORCE_SECRET_B64 == "1")))]
+    for ts in ts_candidates:
+        code, data = _get_with_ts(ts, "/v3/user")
+        api_code, api_msg = _api_error_code_msg(data)
+        msg_up = (str(api_msg) or "").upper()
 
-    # Try /v3/user as a probe
-    for sb64 in secret_candidates:
-        for ts in ts_candidates:
-            code, data = _get_with_combo(ts, sb64, "/v3/user")
-            api_code, api_msg = _api_error_code_msg(data)
-            # Accept if:
-            # - HTTP not 200 (will retry later), or
-            # - JSON has more than just code/msg/timeCost, or
-            # - api_code not a timestamp/signature error
-            if api_code is None:
-                # Likely a non-standard payload or success; accept this combo
-                TS_STYLE_ACTIVE, SECRET_BASE64_ACTIVE = ts, sb64
-                if DEBUG:
-                    _post_text(f"✅ Selected auth combo: ts={ts} secret_b64={'1' if sb64 else '0'} (api_code=None)")
-                return
-            # Known "timestamp" error code/message
-            if api_code == 20002 and isinstance(api_msg, str) and "TIMESTAMP" in api_msg.upper():
-                continue
-            # Known signature errors (examples: invalid signature, auth failed)
-            if isinstance(api_msg, str) and ("SIGNATURE" in api_msg.upper() or "AUTH" in api_msg.upper()):
-                continue
-            # Otherwise accept
-            TS_STYLE_ACTIVE, SECRET_BASE64_ACTIVE = ts, sb64
-            if DEBUG:
-                _post_text(f"✅ Selected auth combo: ts={ts} secret_b64={'1' if sb64 else '0'} (code={api_code} msg={api_msg})")
-            return
+        # Reject obvious failures
+        bad = False
+        if api_code is not None:
+            if api_code in (20002, 20009):
+                bad = True  # timestamp format / expired window
+            if any(k in msg_up for k in ("TIMESTAMP", "EXPIRED", "SIGNATURE", "AUTH")):
+                bad = True
+        if bad:
+            continue
 
-    # Fallback: default if nothing worked (will still show errors, but we tried)
-    TS_STYLE_ACTIVE, SECRET_BASE64_ACTIVE = ts_candidates[0], secret_candidates[0]
-    _post_text(f"⚠️ Could not negotiate; falling back to ts={TS_STYLE_ACTIVE} secret_b64={'1' if SECRET_BASE64_ACTIVE else '0'}")
+        # Accept this ts style
+        TS_STYLE_ACTIVE = ts
+        if DEBUG:
+            _post_text(f"✅ Selected auth combo: ts={TS_STYLE_ACTIVE} (probe code={api_code} msg={api_msg})")
+        return
 
-negotiate_auth_combo()
+    # Fallback
+    TS_STYLE_ACTIVE = ts_candidates[0]
+    _post_text(f"⚠️ Could not negotiate; falling back to ts={TS_STYLE_ACTIVE}")
 
-# ========= High-level API using selected combo =========
+negotiate_ts_style()
+
+# ========= High-level API using selected ts =========
 def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
     url = f"{BASE_URL}{path}"
-    hdrs = _headers(TS_STYLE_ACTIVE, SECRET_BASE64_ACTIVE, path, "GET", None)
+    hdrs = _headers(TS_STYLE_ACTIVE, path, "GET", None)
     r = session.get(url, headers=hdrs, params=params, timeout=(20, 30))
     try:
         data = r.json()
@@ -262,7 +257,7 @@ def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[
     if api_code not in (None, 0):
         logging.error("Omni API error on %s: code=%s msg=%s", path, api_code, api_msg)
         if DEBUG:
-            _post_text(f"⚠️ Omni error {path}: code={api_code} msg={api_msg} (ts={TS_STYLE_ACTIVE} secret_b64={'1' if SECRET_BASE64_ACTIVE else '0'})")
+            _post_text(f"⚠️ Omni error {path}: code={api_code} msg={api_msg} (ts={TS_STYLE_ACTIVE})")
     return r.status_code, data
 
 def get_user() -> Tuple[int, Dict[str, Any]]:
@@ -299,15 +294,20 @@ def _walk_positions(obj: Any, path: str = "$"):
             yield from _walk_positions(v, f"{path}.{k}")
 
 def extract_open_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # Normalize if wrapped under "data"
     acct = payload.get("data", payload) if isinstance(payload, dict) else payload
+
     best_path, best_list = None, []
     for pth, lst in _walk_positions(acct):
         if len(lst) > len(best_list):
             best_path, best_list = pth, lst
+
     if DEBUG:
         _post_text(f"🔎 found positions array at: `{best_path or '<none>'}` (len={len(best_list)})")
+
     open_pos: List[Dict[str, Any]] = []
     for item in best_list:
+        # any recognized size key
         size_val = None
         for k in SIZE_KEYS:
             if k in item:
@@ -315,13 +315,18 @@ def extract_open_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         size = _to_float(size_val)
         if abs(size) <= 0:
             continue
+
         sym   = (item.get("symbol") or item.get("market") or "?").replace("-", "").upper()
         side  = (item.get("side") or ("LONG" if size > 0 else "SHORT")).upper()
         entry = _to_float(item.get("entryPrice") or item.get("avgEntryPrice") or item.get("avgPrice"))
         mark  = _to_float(item.get("markPrice") or item.get("lastPrice") or item.get("indexPrice"))
         lev   = _to_float(item.get("leverage"))
         upl   = _to_float(item.get("unrealizedPnl") or item.get("realizedPnl"))
-        open_pos.append({"symbol": sym, "side": side, "size": size, "entry": entry, "mark": mark, "lev": lev, "uPnL": upl})
+        open_pos.append({
+            "symbol": sym, "side": side, "size": size,
+            "entry": entry, "mark": mark, "lev": lev, "uPnL": upl,
+        })
+
     open_pos.sort(key=lambda x: (x["symbol"], x["side"]))
     return open_pos
 
@@ -345,7 +350,7 @@ def _keys_preview(obj: Any) -> str:
         return "<uninspectable>"
 
 def diagnostics_once() -> None:
-    tcode, _ = _get_with_combo(TS_STYLE_ACTIVE, SECRET_BASE64_ACTIVE, "/v3/time")
+    tcode, _ = _get_with_ts(TS_STYLE_ACTIVE, "/v3/time")
     ucode, user = get_user()
     acode, acct = get_account()
     def _pick(d: Dict[str, Any], k: str):
@@ -355,15 +360,27 @@ def diagnostics_once() -> None:
     acc_id   = _pick(user, "id")              or _pick(acct, "id")
     top_pos = (acct.get("positions") or acct.get("data", {}).get("positions") or []) if isinstance(acct, dict) else []
     ca_pos  = ((acct.get("contractAccount") or {}).get("positions") or []) if isinstance(acct, dict) else []
-    _post_text(
-        "🧪 Diagnostics\n"
-        f"BASE_URL={BASE_URL}\n"
-        f"combo: ts={TS_STYLE_ACTIVE} secret_b64={'1' if SECRET_BASE64_ACTIVE else '0'}\n"
-        f"GET /v3/time → {tcode} | /v3/user → {ucode} | /v3/account → {acode}\n"
-        f"ethereumAddress={eth_addr}\n"
-        f"accountId={acc_id} | l2Key={l2_key}\n"
-        f"positions(top)={len(top_pos)} | positions(contractAccount)={len(ca_pos)}"
-    )
+    if DEBUG:
+        user_keys = _keys_preview(user)
+        acct_keys = _keys_preview(acct)
+        _post_text(
+            "🧪 Diagnostics\n"
+            f"BASE_URL={BASE_URL}\n"
+            f"combo: ts={TS_STYLE_ACTIVE}\n"
+            f"GET /v3/time → {tcode} | /v3/user → {ucode} | /v3/account → {acode}\n"
+            f"ethereumAddress={eth_addr}\n"
+            f"accountId={acc_id} | l2Key={l2_key}\n"
+            f"positions(top)={len(top_pos)} | positions(contractAccount)={len(ca_pos)}\n"
+            f"userKeys: {user_keys}\n"
+            f"acctKeys: {acct_keys}"
+        )
+    else:
+        _post_text(
+            "🧪 Diagnostics\n"
+            f"BASE_URL={BASE_URL}\n"
+            f"combo: ts={TS_STYLE_ACTIVE}\n"
+            f"GET /v3/time → {tcode} | /v3/user → {ucode} | /v3/account → {acode}"
+        )
 
 # ========= Main loop =========
 _last_snapshot: Optional[str] = None
