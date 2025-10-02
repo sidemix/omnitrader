@@ -1,4 +1,4 @@
-# main.py — ApeX Omni → Discord worker (v1.1: mark & pnl columns, rounded, no diagnostics post)
+# main.py — ApeX Omni → Discord worker (v1.2: mark fetch + pnl, rounded, no diagnostics post)
 #
 # Env (accepts both legacy and new names):
 #   APEX_API_KEY        or APEX_KEY
@@ -11,6 +11,8 @@
 #   APEX_MIN_POSITION_SIZE (default 1e-12)
 #   APEX_LATENCY_CUSHION_MS (default 600)
 #   SIZE_DECIMALS / PRICE_DECIMALS / PNL_DECIMALS / PNL_PCT_DECIMALS
+#   UPDATE_MODE (openclose_only | positions_only[default] | any_change)
+#   SIZE_CHANGE_THRESHOLD (default 0)
 #   LOG_LEVEL (default INFO)
 
 import os
@@ -55,6 +57,9 @@ PRICE_DECIMALS = int(os.getenv("PRICE_DECIMALS", "4"))
 PNL_DECIMALS = int(os.getenv("PNL_DECIMALS", "4"))
 PNL_PCT_DECIMALS = int(os.getenv("PNL_PCT_DECIMALS", "2"))
 
+UPDATE_MODE = os.getenv("UPDATE_MODE", "positions_only")  # openclose_only | positions_only | any_change
+SIZE_CHANGE_THRESHOLD = float(os.getenv("SIZE_CHANGE_THRESHOLD", "0"))
+
 if not (API_KEY and API_SECRET and API_PASSPHRASE and DISCORD_WEBHOOK):
     LOG.error(ascii_only("Missing envs: APEX_API_KEY/APEX_KEY, APEX_API_SECRET/APEX_SECRET, APEX_API_PASSPHRASE/APEX_PASSPHRASE, DISCORD_WEBHOOK"))
     sys.exit(1)
@@ -64,7 +69,7 @@ session = requests.Session()
 retries = Retry(total=6, connect=6, read=6, backoff_factor=0.6, status_forcelist=(429, 500, 502, 503, 504))
 session.mount("https://", HTTPAdapter(max_retries=retries))
 session.mount("http://", HTTPAdapter(max_retries=retries))
-session.headers.update({"User-Agent": "apex-omni-discord-bridge/1.1"})
+session.headers.update({"User-Agent": "apex-omni-discord-bridge/1.2"})
 
 # ---------- time & signing (no datetime) ----------
 def get_server_time_seconds() -> int:
@@ -204,6 +209,72 @@ def _fmt_pct(x, dec) -> str:
     except Exception:
         return "-"
 
+# ---------- public marks (best-effort) ----------
+def fetch_marks(symbols: list[str]) -> dict[str, float]:
+    """
+    Try a couple of likely public endpoints to get mark/last prices.
+    Returns {SYMBOL: price}. Silent on failure.
+    """
+    out: dict[str, float] = {}
+    if not symbols:
+        return out
+    uniq = sorted(set(symbols))
+    joined = ",".join(uniq)
+
+    def _parse_tickers(js):
+        # Look under several shapes: data.tick ers[], tickers[], data[]
+        buckets = []
+        if isinstance(js, dict):
+            if isinstance(js.get("data"), dict):
+                for k in ("tickers", "list", "rows"):
+                    if isinstance(js["data"].get(k), list):
+                        buckets.append(js["data"][k])
+            for k in ("tickers", "list", "rows"):
+                if isinstance(js.get(k), list):
+                    buckets.append(js[k])
+        for arr in buckets:
+            for row in arr:
+                try:
+                    sym = str(_first(row, "symbol", "contractSymbol", "market") or "").upper()
+                    px  = _to_float(_first(row, "markPrice", "lastPrice", "price", "indexPrice", "close"))
+                    if sym and px is not None:
+                        out[sym] = px
+                except Exception:
+                    continue
+
+    # 1) Batch tickers
+    try:
+        r = session.get(f"{BASE_URL}/v3/market/tickers", params={"symbols": joined}, timeout=10)
+        if r.ok:
+            _parse_tickers(r.json())
+    except Exception:
+        pass
+
+    # If still missing, try single-symbol endpoints
+    for sym in uniq:
+        if sym in out:
+            continue
+        for path in ("/v3/market/ticker", "/v3/market/price", "/v3/market/last"):
+            try:
+                r = session.get(f"{BASE_URL}{path}", params={"symbol": sym}, timeout=10)
+                if not r.ok:
+                    continue
+                js = {}
+                try: js = r.json()
+                except Exception: js = {}
+                # direct data dict
+                cand = None
+                if isinstance(js, dict) and isinstance(js.get("data"), dict):
+                    cand = _to_float(_first(js["data"], "markPrice", "lastPrice", "price", "indexPrice", "close"))
+                if cand is None and isinstance(js, dict):
+                    cand = _to_float(_first(js, "markPrice", "lastPrice", "price", "indexPrice", "close"))
+                if cand is not None:
+                    out[sym] = cand
+                    break
+            except Exception:
+                continue
+    return out
+
 # ---------- data ----------
 def fetch_account() -> dict:
     r = private_request("GET", "/v3/account")
@@ -260,16 +331,8 @@ def extract_positions(js: dict) -> list[dict]:
             side = _norm_side(_first(p, "side", "positionSide"), size)
             entry = _to_float(_first(p, "entryPrice", "avgEntryPrice", "avgPrice", "entry_price"))
             mark  = _to_float(_first(p, "markPrice", "mark", "lastPrice", "mark_price"))
-
-            pnl = _to_float(_first(p, "unrealizedPnl", "upnl", "pnl", "unrealizedPnL"))
+            pnl   = _to_float(_first(p, "unrealizedPnl", "upnl", "pnl", "unrealizedPnL"))
             pnl_pct = _to_float(_first(p, "unrealizedPnlPercent", "unrealizedPnlRate", "unrealizedPnlRatio"))
-
-            # compute if missing and we have basics
-            sign = 1.0 if side == "LONG" else -1.0
-            if pnl is None and (entry is not None) and (mark is not None):
-                pnl = (mark - entry) * size * sign
-            if pnl_pct is None and (entry is not None) and entry != 0 and (mark is not None):
-                pnl_pct = ((mark - entry) / entry) * 100.0 * sign
 
             out.append({
                 "symbol": symbol, "side": side,
@@ -282,7 +345,22 @@ def extract_positions(js: dict) -> list[dict]:
         except Exception:
             continue
 
-    # dedupe by core identity (avoid spamming on mark/pnl changes)
+    # fetch missing marks (once per poll) and compute pnl
+    need = [p["symbol"] for p in out if p.get("mark") is None]
+    if need:
+        marks = fetch_marks(need)
+        for p in out:
+            if p["mark"] is None and p["symbol"] in marks:
+                p["mark"] = marks[p["symbol"]]
+
+    for p in out:
+        sign = 1.0 if p["side"] == "LONG" else -1.0
+        if p.get("pnl") is None and p.get("entry") not in (None, 0) and p.get("mark") is not None:
+            p["pnl"] = (p["mark"] - p["entry"]) * p["size"] * sign
+        if p.get("pnl_pct") is None and p.get("entry") not in (None, 0) and p.get("mark") is not None:
+            p["pnl_pct"] = ((p["mark"] - p["entry"]) / p["entry"]) * 100.0 * sign
+
+    # dedupe (don’t trigger on mark/pnl only)
     uniq = {}
     for q in out:
         key = (q["symbol"], q["side"], f"{q['size']:.12g}", f"{(q['entry'] if q['entry'] is not None else 'None')}")
@@ -309,18 +387,57 @@ def format_positions(pos: list[dict]) -> str:
         )
     return "```\n" + "\n".join(lines) + "\n```"
 
-# ---------- loop state ----------
-_last_snapshot = None
+# ---------- update policy ----------
+def _quantize_size(x: float) -> float:
+    if SIZE_CHANGE_THRESHOLD > 0:
+        steps = round(x / SIZE_CHANGE_THRESHOLD)
+        return steps * SIZE_CHANGE_THRESHOLD
+    try:
+        return round(float(x), SIZE_DECIMALS)
+    except Exception:
+        return x
 
 def snapshot_of(pos: list[dict]) -> str:
+    """
+    UPDATE_MODE:
+      - openclose_only: only symbol/side presence matters
+      - positions_only (default): symbol/side + (size, entry)
+      - any_change: symbol/side + (size, entry, mark, pnl, pnl_pct)
+    """
     try:
-        key_tuples = [(p["symbol"], p["side"], f"{p['size']:.10g}", f"{p['entry'] if p['entry'] is not None else 'None'}") for p in pos]
-        key_tuples.sort()
-        return json.dumps(key_tuples)
+        if UPDATE_MODE == "openclose_only":
+            keys = sorted({(p["symbol"], p["side"]) for p in pos})
+
+        elif UPDATE_MODE == "any_change":
+            keys = sorted(
+                (
+                    p["symbol"],
+                    p["side"],
+                    _quantize_size(p["size"]),
+                    None if p.get("entry") is None else round(p["entry"], PRICE_DECIMALS),
+                    None if p.get("mark")  is None else round(p["mark"],  PRICE_DECIMALS),
+                    None if p.get("pnl")   is None else round(p["pnl"],   PNL_DECIMALS),
+                    None if p.get("pnl_pct") is None else round(p["pnl_pct"], PNL_PCT_DECIMALS),
+                )
+                for p in pos
+            )
+        else:  # positions_only
+            keys = sorted(
+                (
+                    p["symbol"],
+                    p["side"],
+                    _quantize_size(p["size"]),
+                    None if p.get("entry") is None else round(p["entry"], PRICE_DECIMALS),
+                )
+                for p in pos
+            )
+        return json.dumps(keys)
     except Exception:
         return ""
 
-# ---------- flow ----------
+# ---------- loop ----------
+_last_snapshot = None
+
 def poll_once():
     global _last_snapshot
     acct = fetch_account()
@@ -335,7 +452,6 @@ def poll_once():
 
 def main():
     LOG.info(ascii_only(f"Starting worker. BASE_URL={BASE_URL}"))
-    # no diagnostics Discord post by request
     while True:
         try:
             poll_once()
