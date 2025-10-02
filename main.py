@@ -1,217 +1,165 @@
 # main.py — ApeX Omni → Discord (Render worker)
-# Uses /api/v3/account to fetch positions and posts to Discord embeds.
+# Polls /v3/account and posts open positions to Discord.
 
-import os, time, json, hmac, hashlib, base64, logging, socket
+import os, time, json, hmac, hashlib, base64, logging
 from datetime import datetime, timezone
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ===== ENV =====
+# ==== Env ====
 APEX_KEY        = os.environ["APEX_KEY"]
-APEX_SECRET     = os.environ["APEX_SECRET"]              # raw secret string
+APEX_SECRET     = os.environ["APEX_SECRET"]           # raw secret from Omni UI
 APEX_PASSPHRASE = os.environ["APEX_PASSPHRASE"]
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
+BASE_URL        = os.environ.get("APEX_BASE_URL", "https://omni.apex.exchange/api").rstrip("/")
+POLL_SECS       = int(os.environ.get("POLL_INTERVAL_SECS", "10"))
+DEBUG           = os.environ.get("DEBUG", "0") == "1"
 
-# Omni mainnet by default. For testnet: https://testnet.omni.apex.exchange/api
-BASE_URL  = os.environ.get("APEX_BASE_URL", "https://omni.apex.exchange/api").rstrip("/")
-POLL_SECS = int(os.environ.get("POLL_INTERVAL_SECS", "10"))
-MIN_POST_INTERVAL_SECS = int(os.environ.get("MIN_POST_INTERVAL_SECS", "60"))  # throttle updates
-POST_EMPTY_EVERY_SECS  = int(os.environ.get("POST_EMPTY_EVERY_SECS", "0"))    # 0 = only on transition
-
-# ===== Logging =====
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-logging.info("Starting worker. BASE_URL=%s", BASE_URL)
-
-# ===== HTTP session with retries =====
-session = requests.Session()
-retry = Retry(
-    total=6, connect=6, read=6,
-    backoff_factor=1.5,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET", "POST"],
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s"
 )
+
+# ==== HTTP session with retries ====
+session = requests.Session()
+retry = Retry(total=6, connect=6, read=6, backoff_factor=1.5,
+              status_forcelist=(429, 500, 502, 503, 504),
+              allowed_methods=("GET", "POST"))
 session.mount("https://", HTTPAdapter(max_retries=retry))
 
-# ===== Discord helpers =====
-def post_json(payload: dict):
-    try:
-        session.post(DISCORD_WEBHOOK, json=payload, timeout=(10, 20))
-    except Exception as e:
-        logging.error("Discord post failed: %s", e)
+# ==== Signing (per Omni docs) ====
+def _iso_ts() -> str:
+    # the docs use an ISO-ish string in examples; this works
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
-def code_block_table(rows):
-    return "```\n" + "\n".join(rows) + "\n```"
-
-def positions_embed(positions_norm):
-    ts = datetime.now(timezone.utc).isoformat()
-    if not positions_norm:
-        return {"embeds": [{
-            "title": "Active ApeX Positions",
-            "description": "_No open positions_",
-            "timestamp": ts,
-            "color": 0x7f8c8d,
-            "footer": {"text": "ApeX → Discord"},
-        }]}
-    rows = [
-        "SYMBOL      SIDE  xLEV   SIZE         ENTRY         MARK          uPnL",
-        "----------  ----  ----  -----------  ------------  ------------  ------------",
-    ]
-    total_upnl = 0.0
-    for p in positions_norm:
-        total_upnl += p["uPnL"]
-        rows.append(
-            f"{p['symbol']:<10}  {p['side']:<4}  {int(p['lev']) if p['lev'] else 0:>4}  "
-            f"{p['size']:<11.6g}  {p['entry']:<12.6g}  {p['mark']:<12.6g}  {p['uPnL']:<12.6g}"
-        )
-    color = 0x2ecc71 if total_upnl >= 0 else 0xe74c3c
-    return {"embeds": [{
-        "title": "Active ApeX Positions",
-        "description": code_block_table(rows),
-        "timestamp": ts,
-        "color": color,
-        "footer": {"text": "ApeX → Discord"},
-    }]}
-
-# ===== Omni v3 signing =====
-def sign_v3(path: str, method: str, data: dict | None = None):
-    """
-    Signature = Base64(HMAC_SHA256(Base64(secret), ts + METHOD + path + dataString))
-    For GET requests dataString is ''. For POST it's sorted form 'k=v&k=v'.
-    """
-    ts = str(int(time.time() * 1000))
-    method = method.upper()
-    data_string = ""
+def _sign(path: str, method: str, iso_ts: str, data: dict | None = None) -> str:
+    data = data or {}
+    # canonical dataString (sorted, '&' joined). GETs send params in the path, so this is empty.
     if data:
         items = sorted((k, v) for k, v in data.items() if v is not None)
         data_string = "&".join(f"{k}={v}" for k, v in items)
-    msg = ts + method + path + data_string
+    else:
+        data_string = ""
+    message = f"{iso_ts}{method.upper()}{path}{data_string}"
     key = base64.standard_b64encode(APEX_SECRET.encode("utf-8"))
-    digest = hmac.new(key, msg=msg.encode("utf-8"), digestmod=hashlib.sha256).digest()
-    sig = base64.standard_b64encode(digest).decode()
-    return ts, sig
+    digest = hmac.new(key, msg=message.encode("utf-8"), digestmod=hashlib.sha256).digest()
+    return base64.standard_b64encode(digest).decode()
 
-def headers_v3(ts: str, sig: str):
+def _headers(path: str, method: str, body: dict | None = None) -> dict:
+    ts = _iso_ts()
+    sig = _sign(path, method, ts, body)
     return {
-        "APEX-SIGNATURE": sig,
-        "APEX-TIMESTAMP": ts,
         "APEX-API-KEY": APEX_KEY,
         "APEX-PASSPHRASE": APEX_PASSPHRASE,
-        "Content-Type": "application/json",
+        "APEX-TIMESTAMP": ts,
+        "APEX-SIGNATURE": sig,
     }
 
-# ===== API calls =====
+# ==== Discord ====
+def post_to_discord(text: str):
+    try:
+        session.post(DISCORD_WEBHOOK, json={"content": text}, timeout=10)
+    except Exception as e:
+        logging.error("Discord post failed: %s", e)
+
+# ==== API ====
+def get_json(path: str, params: dict | None = None):
+    url = f"{BASE_URL}{path}"
+    hdrs = _headers(path, "GET")
+    r = session.get(url, headers=hdrs, params=params, timeout=20)
+    return r.status_code, (r.json() if r.headers.get("content-type","").startswith("application/json") else {})
+
 def get_account():
-    """
-    GET /api/v3/account  (sign with path '/v3/account')
-    Returns account state incl. 'positions' (list of current positions).
-    """
-    route = "/v3/account"
-    ts, sig = sign_v3(route, "GET")
-    r = session.get(f"{BASE_URL}{route}", headers=headers_v3(ts, sig), timeout=(20, 30))
-    r.raise_for_status()
-    return r.json()
+    # primary endpoint for positions
+    code, data = get_json("/v3/account")
+    return code, data
 
-# ===== Normalization =====
-def to_float(x):
-    try:
-        return float(x)
-    except Exception:
-        return 0.0
+def extract_open_positions(account: dict):
+    # Try top-level positions first
+    pos = account.get("positions") or []
+    # Also try nested contractAccount.positions (some payloads put it there)
+    nested = (account.get("contractAccount") or {}).get("positions") or []
+    if len(nested) > len(pos):
+        pos = nested
 
-def normalize_positions(account_json):
-    """
-    Keep only fields that matter to avoid noisy diffs.
-    Filter out zero-size positions.
-    """
-    items = []
-    if isinstance(account_json, dict):
-        items = account_json.get("positions") or []
-    norm = []
-    for p in items:
-        size = to_float(p.get("size"))
-        if abs(size) <= 0:
+    open_pos = []
+    for p in pos:
+        try:
+            size = float(p.get("size", "0") or "0")
+        except Exception:
             continue
-        norm.append({
-            "symbol": str(p.get("symbol") or "").replace("-", "").upper(),  # e.g., 'ASTERUSDT'
-            "side":   str(p.get("side") or "").upper(),                     # LONG/SHORT
-            "size":   size,
-            "entry":  to_float(p.get("entryPrice")),
-            "mark":   to_float(p.get("markPrice") or p.get("lastPrice")),
-            "lev":    to_float(p.get("leverage")),
-            "uPnL":   to_float(p.get("unrealizedPnl") or p.get("realizedPnl")),
-        })
-    norm.sort(key=lambda x: (x["symbol"], x["side"]))
-    return norm
+        if abs(size) > 0:
+            sym = p.get("symbol") or p.get("market") or "?"
+            side = "LONG" if size > 0 else "SHORT"
+            entry = p.get("entryPrice") or p.get("avgEntryPrice") or p.get("avgPrice")
+            mark  = p.get("markPrice") or p.get("indexPrice")
+            upl   = p.get("unrealizedPnl") or "0"
+            open_pos.append({
+                "symbol": sym,
+                "side": side,
+                "size": size,
+                "entry": entry,
+                "mark": mark,
+                "upl": upl,
+            })
+    return open_pos
 
-# ===== Diagnostics (one-time post) =====
+def format_lines(positions: list[dict]) -> str:
+    if not positions:
+        return "No open positions"
+    lines = []
+    for p in positions:
+        sym = p["symbol"].replace("-", "")
+        lines.append(f"{sym} {p['side']} size={p['size']} | entry={p['entry']} | mark={p['mark']} | UPL={p['upl']}")
+    return "\n".join(lines)
+
+# ==== Optional quick diagnostics ====
 def diag():
-    host = BASE_URL.split("://",1)[1].split("/",1)[0]
-    lines = [f"🔧 **Diagnostics**  BASE_URL=`{BASE_URL}`  route=`/v3/account`"]
+    # This hits /v3/time (public) and /v3/account (private) and prints a compact report.
     try:
-        ip = session.get("https://api.ipify.org", timeout=(5,10)).text
-        lines.append(f"Egress IP: `{ip}`")
+        t = session.get(f"{BASE_URL}/v3/time", timeout=10)
+        t_ok = t.status_code
     except Exception as e:
-        lines.append(f"Egress IP check failed: `{e}`")
-    try:
-        addrs = list({a[4][0] for a in socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)})
-        lines.append(f"DNS {host} → {addrs}")
-    except Exception as e:
-        lines.append(f"DNS failed: `{e}`")
-    try:
-        r = session.get(f"{BASE_URL}/v3/time", timeout=(10,10))
-        lines.append(f"GET /v3/time → {r.status_code}")
-    except Exception as e:
-        lines.append(f"/v3/time FAILED: `{e}`")
-    post_json({"content": "\n".join(lines)})
+        t_ok = f"err: {e}"
 
-# ===== Main loop =====
-if __name__ == "__main__":
-    try:
+    code, data = get_account()
+    pos = data.get("positions") or []
+    nested = (data.get("contractAccount") or {}).get("positions") or []
+    post_to_discord(
+        "🧪 Diagnostics "
+        f"BASE_URL={BASE_URL}\n"
+        f"GET /v3/time → {t_ok} | GET /v3/account → {code}\n"
+        f"positions(top)={len(pos)} | positions(contractAccount)={len(nested)}"
+    )
+
+# ==== Main loop ====
+_last_payload = None
+
+def loop():
+    global _last_payload
+    if DEBUG:
         diag()
-    except Exception as e:
-        logging.warning("Diagnostics failed: %s", e)
 
-    last_snapshot = None
-    last_post_ts = 0.0
-    last_empty_post_ts = 0.0
-    had_positions_last = False
+    code, account = get_account()
+    if code != 200:
+        logging.error("Account HTTP %s", code)
+        post_to_discord(f"⚠️ Account HTTP {code}")
+        return
 
+    open_pos = extract_open_positions(account)
+    text = format_lines(open_pos)
+
+    # Only post when the text changes to avoid spam
+    if text != _last_payload:
+        post_to_discord(f"● **Active ApeX Positions** ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')})\n{text}")
+        _last_payload = text
+
+if __name__ == "__main__":
+    logging.info("Starting worker. BASE_URL=%s", BASE_URL)
     while True:
         try:
-            account = get_account()
-            norm = normalize_positions(account)
-            snap = json.dumps(norm, sort_keys=True)
-            now = time.time()
-
-            should_post = False
-            if norm:
-                if snap != last_snapshot and (now - last_post_ts) >= MIN_POST_INTERVAL_SECS:
-                    should_post = True
-            else:
-                if had_positions_last:
-                    should_post = True
-                elif POST_EMPTY_EVERY_SECS and (now - last_empty_post_ts) >= POST_EMPTY_EVERY_SECS:
-                    should_post = True
-
-            if should_post:
-                post_json(positions_embed(norm))
-                last_post_ts = now
-                last_snapshot = snap if norm else "EMPTY"
-                if not norm:
-                    last_empty_post_ts = now
-
-            had_positions_last = bool(norm)
-
-        except requests.exceptions.HTTPError as e:
-            body = ""
-            try:
-                body = e.response.text
-            except Exception:
-                pass
-            logging.error("HTTP %s: %s", getattr(e.response, "status_code", "?"), body)
-        except requests.exceptions.RequestException as e:
-            logging.error("HTTP error: %s", e)
+            loop()
         except Exception as e:
-            logging.exception("Unexpected error")
+            logging.exception("Unhandled error: %s", e)
         time.sleep(POLL_SECS)
