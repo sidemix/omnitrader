@@ -26,11 +26,12 @@ def ascii_only(s: str) -> str:
         return s
 
 # ---------- Environment ----------
-BASE_URL = os.getenv("OMNI_BASE_URL", "https://omni.apex.exchange/api").rstrip("/")
-API_KEY = os.getenv("APEX_API_KEY", "")
-API_SECRET = os.getenv("APEX_API_SECRET", "")
-API_PASSPHRASE = os.getenv("APEX_API_PASSPHRASE", "")
+API_KEY        = os.getenv("APEX_API_KEY")        or os.getenv("APEX_KEY", "")
+API_SECRET     = os.getenv("APEX_API_SECRET")     or os.getenv("APEX_SECRET", "")
+API_PASSPHRASE = os.getenv("APEX_API_PASSPHRASE") or os.getenv("APEX_PASSPHRASE", "")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
+BASE_URL = (os.getenv("OMNI_BASE_URL") or os.getenv("APEX_BASE_URL") or "https://omni.apex.exchange/api").rstrip("/")
+
 INTERVAL = int(os.getenv("INTERVAL_SECONDS", "30"))
 SCAN_SYMBOLS = [s.strip().upper() for s in os.getenv("SCAN_SYMBOLS", "").split(",") if s.strip()]
 
