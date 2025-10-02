@@ -1,422 +1,234 @@
-# main.py — ApeX Omni → Discord (Render worker)
-# - Server time sync (+ configurable latency cushion) for APEX-TIMESTAMP
-# - Negotiates timestamp style: ISO first, then MS (never seconds)
-# - Signs v3 per docs:
-#     key = Base64(secret-utf8)
-#     message = timestamp + METHOD + path + dataString
-#     signature = Base64(HMAC_SHA256(key, message))
-# - Surfaces API "code/msg" errors
-# - Recursively finds positions; filters zero-size
-# - Posts clean Discord embeds only when positions change
-
+# main.py
 import os
 import time
-import json
 import hmac
-import hashlib
+import json
 import base64
+import hashlib
 import logging
-from typing import Any, Dict, List, Tuple, Optional
 from datetime import datetime, timezone
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-# ========= ENV =========
-APEX_KEY        = os.environ["APEX_KEY"]
-APEX_SECRET     = os.environ["APEX_SECRET"]            # raw secret string from Omni UI
-APEX_PASSPHRASE = os.environ["APEX_PASSPHRASE"]
-DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
+# ──────────────────────────────────────────────────────────────────────────────
+# Environment
+# ──────────────────────────────────────────────────────────────────────────────
+BASE_URL = os.getenv("APEX_BASE_URL", "https://omni.apex.exchange/api").rstrip("/")
+API_KEY = os.getenv("APEX_API_KEY", "")
+API_SECRET = os.getenv("APEX_API_SECRET", "")
+PASSPHRASE = os.getenv("APEX_API_PASSPHRASE", "")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
+# small cushion so our signed timestamp is slightly ahead of server time
+LATENCY_MS = int(os.getenv("APEX_LATENCY_MS", "500"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-# Omni mainnet by default. For testnet: https://testnet.omni.apex.exchange/api
-BASE_URL  = os.environ.get("APEX_BASE_URL", "https://omni.apex.exchange/api").rstrip("/")
-
-# Polling & posting behavior
-POLL_SECS = int(os.environ.get("POLL_INTERVAL_SECS", "10"))
-MIN_POST_INTERVAL_SECS = int(os.environ.get("MIN_POST_INTERVAL_SECS", "60"))
-POST_EMPTY_EVERY_SECS  = int(os.environ.get("POST_EMPTY_EVERY_SECS", "0"))  # 0 = only on transition
-DEBUG = os.environ.get("DEBUG", "0") == "1"
-
-# Prefer a specific ts style? (leave blank to allow negotiation)
-FORCE_TS_STYLE = os.environ.get("APEX_TS_STYLE", "").lower()   # "", "iso", "ms"
-LATENCY_MS     = int(os.environ.get("APEX_LATENCY_CUSHION_MS", "600"))
-
-# ========= LOGGING =========
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-logging.info("Starting worker. BASE_URL=%s", BASE_URL)
-
-# ========= HTTP session with retries =========
 session = requests.Session()
-retry = Retry(
-    total=6, connect=6, read=6,
-    backoff_factor=1.5,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET", "POST"],
-)
-session.mount("https://", HTTPAdapter(max_retries=retry))
+session.headers.update({"User-Agent": "apex-omni→discord/1.0"})
 
-# ========= Globals chosen by negotiation =========
-TS_STYLE_ACTIVE = "iso"          # "iso" or "ms"
-_server_offset_ms = 0            # server_ms - local_ms
+server_offset_ms = 0  # server_time_ms - local_time_ms
 
-# ========= Discord helpers =========
-def _post_discord_json(payload: Dict[str, Any]) -> None:
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers: time sync & signing (milliseconds timestamp)
+# ──────────────────────────────────────────────────────────────────────────────
+def _now_ms() -> int:
+    return int(time.time() * 1000) + server_offset_ms
+
+
+def _server_time_ms() -> int:
+    """
+    GET /v3/time
+    Response: {"data":{"time": 1648626529}}  # seconds, per docs
+    We normalize to ms.
+    """
+    url = f"{BASE_URL}/v3/time"
+    r = session.get(url, timeout=5)
+    r.raise_for_status()
+    j = r.json()
+    t = (j.get("data") or {}).get("time")
+    if t is None:
+        raise RuntimeError(f"/v3/time missing 'data.time': {j}")
+    # docs show seconds -> convert to ms if needed
+    ms = int(float(t) * 1000) if t < 1e12 else int(t)
+    return ms
+
+
+def sync_clock():
+    global server_offset_ms
     try:
-        session.post(DISCORD_WEBHOOK, json=payload, timeout=(10, 20))
+        srv = _server_time_ms()
+        loc = int(time.time() * 1000)
+        server_offset_ms = srv - loc
     except Exception as e:
-        logging.error("Discord post failed: %s", e)
+        logging.warning("Clock sync failed; falling back to local clock: %s", e)
+        server_offset_ms = 0
 
-def _post_text(text: str) -> None:
-    _post_discord_json({"content": text})
 
-def _code_table(rows: List[str]) -> str:
-    return "```\n" + "\n".join(rows) + "\n```"
+def _sign(request_path: str, method: str, body_params: dict | None, ts_ms: int) -> str:
+    """
+    Signature per Omni v3:
+      message = timestamp + method + path + dataString
+      key     = base64(secret)
+      digest  = HMAC-SHA256(message, key); base64-encode result
+    For GET requests, dataString is empty (query params are included in `path` if any).
+    """
+    if body_params is None:
+        body_params = {}
+    # Build dataString for POST only (application/x-www-form-urlencoded sorted by key)
+    if method.upper() == "POST":
+        items = sorted((k, v) for k, v in body_params.items() if v is not None)
+        data_string = "&".join(f"{k}={v}" for k, v in items)
+    else:
+        data_string = ""
 
-def _positions_embed(norm: List[Dict[str, Any]]) -> Dict[str, Any]:
-    ts = datetime.now(timezone.utc).isoformat()
-    if not norm:
-        return {"embeds": [{
-            "title": "Active ApeX Positions",
-            "description": "_No open positions_",
-            "timestamp": ts,
-            "color": 0x7f8c8d,
-            "footer": {"text": "ApeX → Discord"},
-        }]}
-    rows = [
-        "SYMBOL      SIDE  xLEV   SIZE         ENTRY         MARK          uPnL",
-        "----------  ----  ----  -----------  ------------  ------------  ------------",
-    ]
-    total_upnl = 0.0
-    for p in norm:
-        total_upnl += float(p["uPnL"])
-        rows.append(
-            f"{p['symbol']:<10}  {p['side']:<4}  {int(p['lev']) if p['lev'] else 0:>4}  "
-            f"{p['size']:<11.6g}  {p['entry']:<12.6g}  {p['mark']:<12.6g}  {p['uPnL']:<12.6g}"
-        )
-    color = 0x2ecc71 if total_upnl >= 0 else 0xe74c3c
-    return {"embeds": [{
-        "title": "Active ApeX Positions",
-        "description": _code_table(rows),
-        "timestamp": ts,
-        "color": color,
-        "footer": {"text": "ApeX → Discord"},
-    }]}
+    # IMPORTANT: ApeX expects **milliseconds** string in the header and message
+    ts_str = str(int(ts_ms))
+    message = f"{ts_str}{method.upper()}{request_path}{data_string}"
 
-# ========= Server time sync =========
-def _parse_server_time_to_ms(payload: Dict[str, Any]) -> Optional[int]:
-    d = payload or {}
-    cand = None
-    if isinstance(d.get("data"), dict):
-        dd = d["data"]
-        cand = dd.get("serverTime") or dd.get("timestamp") or dd.get("time") or dd.get("now")
-    if cand is None:
-        cand = d.get("serverTime") or d.get("timestamp") or d.get("time") or d.get("now")
-    if cand is None:
-        return None
-    # numeric seconds or ms
-    try:
-        val = float(cand)
-        if val > 1e12:  # ms
-            return int(val)
-        if val > 1e9:   # seconds
-            return int(val * 1000)
-    except Exception:
-        pass
-    # ISO fallback
-    try:
-        s = str(cand)
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        return int(dt.timestamp() * 1000)
-    except Exception:
-        return None
-
-def sync_server_time() -> None:
-    global _server_offset_ms
-    try:
-        r = session.get(f"{BASE_URL}/v3/time", timeout=(10, 10))
-        r.raise_for_status()
-        data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-    except Exception as e:
-        logging.warning("Failed to fetch /v3/time: %s", e)
-        return
-    server_ms = _parse_server_time_to_ms(data)
-    if server_ms is None:
-        logging.warning("Could not parse server time from /v3/time: %s", data)
-        return
-    local_ms = int(time.time() * 1000)
-    _server_offset_ms = server_ms - local_ms
-    if DEBUG:
-        _post_text(f"⏱ server sync: server_ms={server_ms} local_ms={local_ms} offset_ms={_server_offset_ms}")
-
-sync_server_time()
-_last_sync = time.time()
-
-def _ts_value(style: str) -> str:
-    global _last_sync
-    now = time.time()
-    if now - _last_sync > 300:  # re-sync every 5 minutes
-        sync_server_time()
-        _last_sync = now
-
-    # base value from synced server time (+ latency cushion)
-    ms = int(time.time() * 1000) + _server_offset_ms + LATENCY_MS
-
-    if style == "iso":
-        dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
-        return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    # style == "ms"
-    return str(ms)
-
-# ========= Signing (Omni v3) =========
-def _data_string(data: Optional[Dict[str, Any]]) -> str:
-    if not data:
-        return ""
-    items = sorted((k, v) for k, v in data.items() if v is not None)
-    return "&".join(f"{k}={v}" for k, v in items)
-
-def _sign(ts: str, path: str, method: str, data: Optional[Dict[str, Any]]) -> str:
-    # Official: key = Base64(secret-utf8)
-    key_bytes = base64.standard_b64encode(APEX_SECRET.encode("utf-8"))
-    msg = ts + method.upper() + path + _data_string(data)
-    digest = hmac.new(key_bytes, msg=msg.encode("utf-8"), digestmod=hashlib.sha256).digest()
+    key = base64.standard_b64encode(API_SECRET.encode("utf-8"))
+    digest = hmac.new(key, msg=message.encode("utf-8"), digestmod=hashlib.sha256).digest()
     return base64.standard_b64encode(digest).decode()
 
-def _headers(ts_style: str, path: str, method: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
-    ts = _ts_value(ts_style)
-    sig = _sign(ts, path, method, data)
+
+def _headers(path: str, method: str = "GET", body_params: dict | None = None) -> dict:
+    ts_ms = _now_ms() + LATENCY_MS
+    signature = _sign(path, method, body_params, ts_ms)
     return {
-        "APEX-API-KEY": APEX_KEY,
-        "APEX-PASSPHRASE": APEX_PASSPHRASE,
-        "APEX-TIMESTAMP": ts,
-        "APEX-SIGNATURE": sig,
-        "Content-Type": "application/json",
+        "APEX-API-KEY": API_KEY,
+        "APEX-PASSPHRASE": PASSPHRASE,
+        "APEX-TIMESTAMP": str(ts_ms),  # <— 13-digit milliseconds
+        "APEX-SIGNATURE": signature,
     }
 
-# ========= Low-level GET with chosen ts =========
-def _get_with_ts(ts_style: str, path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Minimal client
+# ──────────────────────────────────────────────────────────────────────────────
+def apex_get(path: str, params: dict | None = None, timeout: int = 10) -> dict:
     url = f"{BASE_URL}{path}"
-    hdrs = _headers(ts_style, path, "GET", None)
-    r = session.get(url, headers=hdrs, params=params, timeout=(20, 30))
-    try:
-        data = r.json()
-    except Exception:
-        data = {}
-    return r.status_code, data
+    r = session.get(url, headers=_headers(path, "GET"), params=params, timeout=timeout)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code} {path} body={r.text[:300]}")
+    j = r.json()
+    # Omni wraps errors as code/msg
+    if isinstance(j, dict) and j.get("code") not in (None, 0):
+        raise RuntimeError(f"Omni API error on {path}: code={j.get('code')} msg={j.get('msg')}")
+    return j
 
-def _api_error_code_msg(data: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]]:
-    return data.get("code"), data.get("msg")
 
-# ========= Negotiation (timestamp style) =========
-def negotiate_ts_style() -> None:
-    global TS_STYLE_ACTIVE
-    if FORCE_TS_STYLE in ("iso", "ms"):
-        TS_STYLE_ACTIVE = FORCE_TS_STYLE
-        if DEBUG:
-            _post_text(f"✅ Forced ts={TS_STYLE_ACTIVE}")
+def get_user() -> dict:
+    return apex_get("/v3/user")
+
+
+def get_account() -> dict:
+    return apex_get("/v3/account")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Position extraction & formatting
+# ──────────────────────────────────────────────────────────────────────────────
+def extract_positions(account_json: dict) -> list[dict]:
+    """
+    Account response bundles identifiers and trading state.
+    We'll look for 'positions' in the usual places and return a list (possibly empty).
+    """
+    data = account_json.get("data") or account_json
+    candidates = [
+        data.get("positions"),
+        (data.get("contractAccount") or {}).get("positions"),
+        (data.get("spotAccount") or {}).get("positions"),
+    ]
+    for c in candidates:
+        if isinstance(c, list):
+            return c
+    return []
+
+
+def format_positions(positions: list[dict]) -> str:
+    if not positions:
+        return "No open positions"
+    lines = []
+    for p in positions:
+        sym = p.get("symbol") or p.get("contractSymbol") or p.get("market") or "?"
+        side = p.get("side") or p.get("positionSide") or "?"
+        size = p.get("size") or p.get("position") or p.get("quantity") or "?"
+        entry = p.get("entryPrice") or p.get("avgEntryPrice") or p.get("avgPrice") or "?"
+        upl = p.get("unRealizedPnl") or p.get("unrealizedPnl") or p.get("unrealized") or "?"
+        liq = p.get("liqPrice") or p.get("liquidationPrice")
+        line = f"• {sym} {side}  size={size}  entry={entry}  uPnL={upl}"
+        if liq:
+            line += f"  liq={liq}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Discord
+# ──────────────────────────────────────────────────────────────────────────────
+def discord_post(content: str | None = None, embeds: list | None = None):
+    if not DISCORD_WEBHOOK:
         return
-
-    # Try ISO then MS ONLY (never seconds)
-    for ts in ("iso", "ms"):
-        code, data = _get_with_ts(ts, "/v3/user")
-        api_code, api_msg = _api_error_code_msg(data)
-        msg_up = (str(api_msg) or "").upper()
-
-        # Reject if timestamp/signature/auth issues
-        if api_code in (20002, 20009) or any(k in msg_up for k in ("TIMESTAMP", "EXPIRED", "SIGNATURE", "AUTH")):
-            continue
-
-        TS_STYLE_ACTIVE = ts
-        if DEBUG:
-            _post_text(f"✅ Selected ts={TS_STYLE_ACTIVE} (probe code={api_code} msg={api_msg})")
-        return
-
-    # Fallback to ISO
-    TS_STYLE_ACTIVE = "iso"
-    _post_text("⚠️ Negotiation failed; forcing ts=iso")
-
-negotiate_ts_style()
-
-# ========= High-level API using selected ts =========
-def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
-    url = f"{BASE_URL}{path}"
-    hdrs = _headers(TS_STYLE_ACTIVE, path, "GET", None)
-    r = session.get(url, headers=hdrs, params=params, timeout=(20, 30))
+    payload = {}
+    if content:
+        payload["content"] = content[:1990]
+    if embeds:
+        payload["embeds"] = embeds
     try:
-        data = r.json()
-    except Exception:
-        data = {}
-    api_code, api_msg = _api_error_code_msg(data)
-    if api_code not in (None, 0):
-        logging.error("Omni API error on %s: code=%s msg=%s", path, api_code, api_msg)
-        if DEBUG:
-            _post_text(f"⚠️ Omni error {path}: code={api_code} msg={api_msg} (ts={TS_STYLE_ACTIVE})")
-    return r.status_code, data
+        rr = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+        rr.raise_for_status()
+    except Exception as e:
+        logging.error("discord_post failed: %s", e)
 
-def get_user() -> Tuple[int, Dict[str, Any]]:
-    return _get("/v3/user")
 
-def get_account() -> Tuple[int, Dict[str, Any]]:
-    return _get("/v3/account")
-
-# ========= Position extraction =========
-SIZE_KEYS = {"size", "positionSize", "qty", "quantity", "positionQty"}
-
-def _to_float(x: Any) -> float:
+# ──────────────────────────────────────────────────────────────────────────────
+# Diagnostics & loop
+# ──────────────────────────────────────────────────────────────────────────────
+def diagnostics_once():
     try:
-        return float(x)
-    except Exception:
-        return 0.0
+        srv = _server_time_ms()
+        drift = srv - int(time.time() * 1000)
+        user = get_user()
+        acct = get_account()
+        pos = extract_positions(acct)
+        lines = [
+            "🧪 Diagnostics",
+            f"BASE_URL={BASE_URL}",
+            f"timestamp_mode=ms  drift={drift}ms  latency_pad={LATENCY_MS}ms",
+            f"/v3/user → code={user.get('code', 0)}",
+            f"/v3/account → code={acct.get('code', 0)}",
+            f"positions={len(pos)}",
+        ]
+        discord_post("\n".join(lines))
+    except Exception as e:
+        discord_post(f"🧪 Diagnostics failed: {e}")
 
-def _looks_like_position(item: Any) -> bool:
-    if not isinstance(item, dict):
-        return False
-    lk = {k.lower() for k in item.keys()}
-    has_sym = ("symbol" in lk) or ("market" in lk)
-    has_size = any(k in lk for k in SIZE_KEYS)
-    return has_sym and has_size
 
-def _walk_positions(obj: Any, path: str = "$"):
-    if isinstance(obj, list):
-        if obj and isinstance(obj[0], dict) and _looks_like_position(obj[0]):
-            yield path, obj
-        for i, v in enumerate(obj):
-            yield from _walk_positions(v, f"{path}[{i}]")
-    elif isinstance(obj, dict):
-        for k, v in obj.items():
-            yield from _walk_positions(v, f"{path}.{k}")
-
-def extract_open_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    # Normalize if wrapped under "data"
-    acct = payload.get("data", payload) if isinstance(payload, dict) else payload
-
-    best_path, best_list = None, []
-    for pth, lst in _walk_positions(acct):
-        if len(lst) > len(best_list):
-            best_path, best_list = pth, lst
-
-    if DEBUG:
-        _post_text(f"🔎 found positions array at: `{best_path or '<none>'}` (len={len(best_list)})")
-
-    open_pos: List[Dict[str, Any]] = []
-    for item in best_list:
-        # any recognized size key
-        size_val = None
-        for k in SIZE_KEYS:
-            if k in item:
-                size_val = item.get(k); break
-        size = _to_float(size_val)
-        if abs(size) <= 0:
-            continue
-
-        sym   = (item.get("symbol") or item.get("market") or "?").replace("-", "").upper()
-        side  = (item.get("side") or ("LONG" if size > 0 else "SHORT")).upper()
-        entry = _to_float(item.get("entryPrice") or item.get("avgEntryPrice") or item.get("avgPrice"))
-        mark  = _to_float(item.get("markPrice") or item.get("lastPrice") or item.get("indexPrice"))
-        lev   = _to_float(item.get("leverage"))
-        upl   = _to_float(item.get("unrealizedPnl") or item.get("realizedPnl"))
-        open_pos.append({
-            "symbol": sym, "side": side, "size": size,
-            "entry": entry, "mark": mark, "lev": lev, "uPnL": upl,
-        })
-
-    open_pos.sort(key=lambda x: (x["symbol"], x["side"]))
-    return open_pos
-
-# ========= Diagnostics =========
-def _keys_preview(obj: Any) -> str:
-    try:
-        if isinstance(obj, dict):
-            lines = []
-            for k, v in list(obj.items())[:30]:
-                t = type(v).__name__
-                if isinstance(v, dict):
-                    lines.append(f"{k}: dict({len(v)})")
-                elif isinstance(v, list):
-                    inner = type(v[0]).__name__ if v else "empty"
-                    lines.append(f"{k}: list[{inner}]({len(v)})")
-                else:
-                    lines.append(f"{k}: {t}")
-            return "; ".join(lines) or "<empty dict>"
-        return type(obj).__name__
-    except Exception:
-        return "<uninspectable>"
-
-def diagnostics_once() -> None:
-    tcode, _ = _get_with_ts(TS_STYLE_ACTIVE, "/v3/time")
-    ucode, user = get_user()
-    acode, acct = get_account()
-    def _pick(d: Dict[str, Any], k: str):
-        return d.get(k) or d.get("data", {}).get(k) or d.get("user", {}).get(k)
-    eth_addr = _pick(user, "ethereumAddress") or _pick(acct, "ethereumAddress")
-    l2_key   = _pick(user, "l2Key")           or _pick(acct, "l2Key")
-    acc_id   = _pick(user, "id")              or _pick(acct, "id")
-    top_pos = (acct.get("positions") or acct.get("data", {}).get("positions") or []) if isinstance(acct, dict) else []
-    ca_pos  = ((acct.get("contractAccount") or {}).get("positions") or []) if isinstance(acct, dict) else []
-    if DEBUG:
-        user_keys = _keys_preview(user)
-        acct_keys = _keys_preview(acct)
-        _post_text(
-            "🧪 Diagnostics\n"
-            f"BASE_URL={BASE_URL}\n"
-            f"combo: ts={TS_STYLE_ACTIVE}\n"
-            f"GET /v3/time → {tcode} | /v3/user → {ucode} | /v3/account → {acode}\n"
-            f"ethereumAddress={eth_addr}\n"
-            f"accountId={acc_id} | l2Key={l2_key}\n"
-            f"positions(top)={len(top_pos)} | positions(contractAccount)={len(ca_pos)}\n"
-            f"userKeys: {user_keys}\n"
-            f"acctKeys: {acct_keys}"
-        )
-    else:
-        _post_text(
-            "🧪 Diagnostics\n"
-            f"BASE_URL={BASE_URL}\n"
-            f"combo: ts={TS_STYLE_ACTIVE}\n"
-            f"GET /v3/time → {tcode} | /v3/user → {ucode} | /v3/account → {acode}"
-        )
-
-# ========= Main loop =========
-_last_snapshot: Optional[str] = None
-_last_post_ts = 0.0
-_last_empty_post_ts = 0.0
-_had_positions_last = False
-
-def _should_post(norm: List[Dict[str, Any]], snap: str, now: float) -> bool:
-    global _last_snapshot, _last_post_ts, _last_empty_post_ts, _had_positions_last
-    if norm:
-        if snap != _last_snapshot and (now - _last_post_ts) >= MIN_POST_INTERVAL_SECS:
-            return True
-    else:
-        if _had_positions_last:
-            return True
-        if POST_EMPTY_EVERY_SECS and (now - _last_empty_post_ts) >= POST_EMPTY_EVERY_SECS:
-            return True
-    return False
-
-def _record_post_state(norm: List[Dict[str, Any]], snap: str, now: float) -> None:
-    global _last_snapshot, _last_post_ts, _last_empty_post_ts, _had_positions_last
-    _last_post_ts = now
-    _last_snapshot = snap if norm else "EMPTY"
-    if not norm:
-        _last_empty_post_ts = now
-    _had_positions_last = bool(norm)
-
-def loop_once() -> None:
-    acode, acct = get_account()
-    norm = extract_open_positions(acct)
-    snap = json.dumps(norm, sort_keys=True)
-    now = time.time()
-    if _should_post(norm, snap, now):
-        _post_discord_json(_positions_embed(norm))
-        _record_post_state(norm, snap, now)
-
-if __name__ == "__main__":
+def main():
+    logging.info("Starting worker. BASE_URL=%s", BASE_URL)
+    if not (API_KEY and API_SECRET and PASSPHRASE and DISCORD_WEBHOOK):
+        logging.error("Missing required env: APEX_API_KEY, APEX_API_SECRET, APEX_API_PASSPHRASE, DISCORD_WEBHOOK")
+    sync_clock()
+    discord_post("ApeX → Discord bridge online. Using **ms** timestamps.")
     diagnostics_once()
+
+    seen_fingerprints: set[str] = set()
     while True:
         try:
-            loop_once()
+            acct = get_account()
+            positions = extract_positions(acct)
+            # build a lightweight fingerprint to avoid spam
+            fp = json.dumps(sorted([(p.get("symbol"), p.get("side"), str(p.get("size"))) for p in positions]))
+            if fp not in seen_fingerprints:
+                seen_fingerprints.add(fp)
+                msg = f"**Active ApeX Positions**\n{format_positions(positions)}"
+                discord_post(msg)
         except Exception as e:
-            logging.exception("Unhandled error: %s", e)
-        time.sleep(POLL_SECS)
+            logging.error("%s", e)
+            discord_post(f"⚠️ {e}")
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s: %(message)s")
+    main()
