@@ -1,234 +1,292 @@
-# main.py
 import os
+import sys
 import time
 import hmac
-import json
 import base64
 import hashlib
 import logging
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 
 import requests
+from requests.adapters import HTTPAdapter, Retry
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Environment
-# ──────────────────────────────────────────────────────────────────────────────
-BASE_URL = os.getenv("APEX_BASE_URL", "https://omni.apex.exchange/api").rstrip("/")
+# ---------- Config & logging (ASCII-only in stdout) ----------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s: %(message)s",
+)
+LOG = logging.getLogger("apex-bridge")
+
+def ascii_only(s: str) -> str:
+    # Avoid latin-1/ascii codec crashes in Render logs
+    try:
+        return s.encode("ascii", "ignore").decode("ascii")
+    except Exception:
+        return s
+
+# ---------- Environment ----------
+BASE_URL = os.getenv("OMNI_BASE_URL", "https://omni.apex.exchange/api").rstrip("/")
 API_KEY = os.getenv("APEX_API_KEY", "")
 API_SECRET = os.getenv("APEX_API_SECRET", "")
-PASSPHRASE = os.getenv("APEX_API_PASSPHRASE", "")
+API_PASSPHRASE = os.getenv("APEX_API_PASSPHRASE", "")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
-# small cushion so our signed timestamp is slightly ahead of server time
-LATENCY_MS = int(os.getenv("APEX_LATENCY_MS", "500"))
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+INTERVAL = int(os.getenv("INTERVAL_SECONDS", "30"))
+SCAN_SYMBOLS = [s.strip().upper() for s in os.getenv("SCAN_SYMBOLS", "").split(",") if s.strip()]
 
+if not (API_KEY and API_SECRET and API_PASSPHRASE and DISCORD_WEBHOOK):
+    LOG.error(ascii_only("Missing one or more required envs: APEX_API_KEY, APEX_API_SECRET, APEX_API_PASSPHRASE, DISCORD_WEBHOOK"))
+    sys.exit(1)
+
+# ---------- HTTP session ----------
 session = requests.Session()
-session.headers.update({"User-Agent": "apex-omni→discord/1.0"})
+retries = Retry(
+    total=6,
+    connect=6,
+    read=6,
+    backoff_factor=0.5,
+    status_forcelist=(429, 500, 502, 503, 504),
+)
+session.mount("https://", HTTPAdapter(max_retries=retries))
+session.mount("http://", HTTPAdapter(max_retries=retries))
+session.headers.update({"User-Agent": "apex-omni-discord-bridge/1.0"})
 
-server_offset_ms = 0  # server_time_ms - local_time_ms
+# ---------- Helpers from docs ----------
+# Signature content: timeStamp + method + path + dataString
+# HMAC-SHA256 with base64(secret) as key, then base64-encode the digest.
+# Ref: ApeX Omni API docs (ApiKey Signature) and sample sign() method.
+# https://api-docs.pro.apex.exchange/  (Account -> GET /v3/account, ApiKey Signature)  # citation in chat text
 
+def _format_iso_from_server_ts(server_ts_seconds: int) -> str:
+    # ISO8601 with millisecond precision and 'Z'
+    dt = datetime.fromtimestamp(server_ts_seconds, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:23] + "Z"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers: time sync & signing (milliseconds timestamp)
-# ──────────────────────────────────────────────────────────────────────────────
-def _now_ms() -> int:
-    return int(time.time() * 1000) + server_offset_ms
-
-
-def _server_time_ms() -> int:
-    """
-    GET /v3/time
-    Response: {"data":{"time": 1648626529}}  # seconds, per docs
-    We normalize to ms.
-    """
-    url = f"{BASE_URL}/v3/time"
-    r = session.get(url, timeout=5)
-    r.raise_for_status()
-    j = r.json()
-    t = (j.get("data") or {}).get("time")
-    if t is None:
-        raise RuntimeError(f"/v3/time missing 'data.time': {j}")
-    # docs show seconds -> convert to ms if needed
-    ms = int(float(t) * 1000) if t < 1e12 else int(t)
-    return ms
-
-
-def sync_clock():
-    global server_offset_ms
-    try:
-        srv = _server_time_ms()
-        loc = int(time.time() * 1000)
-        server_offset_ms = srv - loc
-    except Exception as e:
-        logging.warning("Clock sync failed; falling back to local clock: %s", e)
-        server_offset_ms = 0
-
-
-def _sign(request_path: str, method: str, body_params: dict | None, ts_ms: int) -> str:
-    """
-    Signature per Omni v3:
-      message = timestamp + method + path + dataString
-      key     = base64(secret)
-      digest  = HMAC-SHA256(message, key); base64-encode result
-    For GET requests, dataString is empty (query params are included in `path` if any).
-    """
-    if body_params is None:
-        body_params = {}
-    # Build dataString for POST only (application/x-www-form-urlencoded sorted by key)
-    if method.upper() == "POST":
-        items = sorted((k, v) for k, v in body_params.items() if v is not None)
-        data_string = "&".join(f"{k}={v}" for k, v in items)
-    else:
+def _sign(timestamp_str: str, method: str, request_path: str, data: dict | None) -> str:
+    method = method.upper()
+    if data is None:
+        data = {}
+    if method == "GET":
         data_string = ""
-
-    # IMPORTANT: ApeX expects **milliseconds** string in the header and message
-    ts_str = str(int(ts_ms))
-    message = f"{ts_str}{method.upper()}{request_path}{data_string}"
-
+    else:
+        # Sort body fields alphabetically: key1=v1&key2=v2 ...
+        items = sorted((k, v) for k, v in data.items())
+        data_string = "&".join(f"{k}={v}" for k, v in items)
+    message = f"{timestamp_str}{method}{request_path}{data_string}"
+    # IMPORTANT: HMAC key is base64(secret)
     key = base64.standard_b64encode(API_SECRET.encode("utf-8"))
-    digest = hmac.new(key, msg=message.encode("utf-8"), digestmod=hashlib.sha256).digest()
-    return base64.standard_b64encode(digest).decode()
+    digest = hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
+    return base64.standard_b64encode(digest).decode("utf-8")
 
-
-def _headers(path: str, method: str = "GET", body_params: dict | None = None) -> dict:
-    ts_ms = _now_ms() + LATENCY_MS
-    signature = _sign(path, method, body_params, ts_ms)
+def _private_headers(ts_str: str, sig: str) -> dict:
     return {
+        "APEX-SIGNATURE": sig,
+        "APEX-TIMESTAMP": ts_str,
         "APEX-API-KEY": API_KEY,
-        "APEX-PASSPHRASE": PASSPHRASE,
-        "APEX-TIMESTAMP": str(ts_ms),  # <— 13-digit milliseconds
-        "APEX-SIGNATURE": signature,
+        "APEX-PASSPHRASE": API_PASSPHRASE,
     }
 
+def _get_server_time_seconds() -> int:
+    url = f"{BASE_URL}/v3/time"
+    r = session.get(url, timeout=10)
+    r.raise_for_status()
+    # Docs show integer system time. Use 'time' or 'serverTime' if present.
+    js = r.json()
+    # accept any of these keys
+    for k in ("time", "serverTime", "server_timestamp", "serverTs"):
+        if k in js and isinstance(js[k], (int, float)):
+            return int(js[k])
+    # Some implementations return data wrapper
+    data = js.get("data") if isinstance(js, dict) else None
+    if isinstance(data, dict):
+        for k in ("time", "serverTime"):
+            if k in data and isinstance(data[k], (int, float)):
+                return int(data[k])
+    # Fallback: parse as int directly
+    try:
+        return int(js)
+    except Exception:
+        raise RuntimeError(f"Unexpected /v3/time response: {js}")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Minimal client
-# ──────────────────────────────────────────────────────────────────────────────
-def apex_get(path: str, params: dict | None = None, timeout: int = 10) -> dict:
-    url = f"{BASE_URL}{path}"
-    r = session.get(url, headers=_headers(path, "GET"), params=params, timeout=timeout)
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code} {path} body={r.text[:300]}")
-    j = r.json()
-    # Omni wraps errors as code/msg
-    if isinstance(j, dict) and j.get("code") not in (None, 0):
-        raise RuntimeError(f"Omni API error on {path}: code={j.get('code')} msg={j.get('msg')}")
-    return j
-
-
-def get_user() -> dict:
-    return apex_get("/v3/user")
-
-
-def get_account() -> dict:
-    return apex_get("/v3/account")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Position extraction & formatting
-# ──────────────────────────────────────────────────────────────────────────────
-def extract_positions(account_json: dict) -> list[dict]:
+def _request_private(method: str, path_v3: str, params: dict | None = None, data: dict | None = None) -> requests.Response:
     """
-    Account response bundles identifiers and trading state.
-    We'll look for 'positions' in the usual places and return a list (possibly empty).
+    path_v3 must start with '/api/v3/...'
+    tries ISO -> ms -> s timestamps. Uses server time to avoid skew.
     """
-    data = account_json.get("data") or account_json
-    candidates = [
-        data.get("positions"),
-        (data.get("contractAccount") or {}).get("positions"),
-        (data.get("spotAccount") or {}).get("positions"),
+    assert path_v3.startswith("/api/v3/"), "path_v3 must include '/api/v3/...'"
+    url = f"{BASE_URL}{path_v3[4:]}" if BASE_URL.endswith("/api") else f"{BASE_URL}{path_v3[4:]}"
+    # ^ BASE_URL already ends with /api; path_v3 also contains /api prefix.
+    # Construct a GET URL with query (docs: include query in the signed path)
+    query = ""
+    if method.upper() == "GET" and params:
+        query = "?" + urlencode(params, doseq=True)
+    server_ts = _get_server_time_seconds()
+
+    attempts = [
+        ("iso", _format_iso_from_server_ts(server_ts)),
+        ("ms", str(int(server_ts * 1000))),
+        ("s", str(int(server_ts))),
     ]
-    for c in candidates:
-        if isinstance(c, list):
-            return c
-    return []
 
+    last_exc = None
+    for label, ts in attempts:
+        try:
+            # Build the request_path including query (for GET)
+            request_path = f"/api/v3{path_v3.split('/v3',1)[1]}{query}"
+            sig = _sign(ts, method, request_path, data if method.upper() != "GET" else {})
+            headers = _private_headers(ts, sig)
+            if method.upper() == "GET":
+                resp = session.get(url + query, headers=headers, timeout=15)
+            else:
+                # x-www-form-urlencoded body, as per docs
+                resp = session.post(url, headers=headers, data=data or {}, timeout=20)
+            # If Omni wraps errors in JSON with 'code', surface it
+            if resp.headers.get("Content-Type", "").startswith("application/json"):
+                body = {}
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = {}
+                if isinstance(body, dict) and "code" in body and body.get("code") != 0:
+                    code, msg = body.get("code"), str(body.get("msg"))
+                    # 20002 -> timestamp error, 20009 -> expired; try next format
+                    if code in (20002, 20009) and "timestamp" in msg.lower():
+                        LOG.warning(ascii_only(f"Omni API error on {path_v3}: code={code} msg={msg} (ts={label})"))
+                        continue  # try next ts format
+            resp.raise_for_status()
+            return resp
+        except Exception as e:
+            last_exc = e
+            LOG.warning(ascii_only(f"Retrying with different timestamp format ({label}) due to: {e}"))
+            time.sleep(0.3)
+
+    # All attempts failed
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Unknown signing error")
+
+# ---------- Discord ----------
+def post_to_discord(text: str):
+    try:
+        payload = {"content": text}
+        r = session.post(DISCORD_WEBHOOK, json=payload, timeout=15)
+        r.raise_for_status()
+    except Exception as e:
+        LOG.error(ascii_only(f"Discord post failed: {e}"))
+
+# ---------- Position fetch & format ----------
+def fetch_account() -> dict:
+    r = _request_private("GET", "/api/v3/account")
+    return r.json()
+
+def extract_positions(account_json: dict) -> list[dict]:
+    # Look for positions arrays in several places
+    candidates = []
+    if isinstance(account_json, dict):
+        if isinstance(account_json.get("positions"), list):
+            candidates.extend(account_json["positions"])
+        if isinstance(account_json.get("openPositions"), list):
+            candidates.extend(account_json["openPositions"])
+        ca = account_json.get("contractAccount") or {}
+        if isinstance(ca.get("openPositions"), list):
+            candidates.extend(ca["openPositions"])
+        # Some APIs wrap in 'data'
+        data = account_json.get("data")
+        if isinstance(data, dict):
+            if isinstance(data.get("positions"), list):
+                candidates.extend(data["positions"])
+            if isinstance(data.get("openPositions"), list):
+                candidates.extend(data["openPositions"])
+            dca = data.get("contractAccount") or {}
+            if isinstance(dca.get("openPositions"), list):
+                candidates.extend(dca["openPositions"])
+    # De-dup naive (by symbol+side+entryPrice)
+    uniq = {}
+    for p in candidates:
+        sym = str(p.get("symbol", "")).upper()
+        if SCAN_SYMBOLS and sym not in SCAN_SYMBOLS:
+            continue
+        key = (sym, p.get("side"), p.get("entryPrice"), p.get("size"))
+        uniq[key] = p
+    return list(uniq.values())
 
 def format_positions(positions: list[dict]) -> str:
     if not positions:
         return "No open positions"
     lines = []
     for p in positions:
-        sym = p.get("symbol") or p.get("contractSymbol") or p.get("market") or "?"
-        side = p.get("side") or p.get("positionSide") or "?"
-        size = p.get("size") or p.get("position") or p.get("quantity") or "?"
-        entry = p.get("entryPrice") or p.get("avgEntryPrice") or p.get("avgPrice") or "?"
-        upl = p.get("unRealizedPnl") or p.get("unrealizedPnl") or p.get("unrealized") or "?"
-        liq = p.get("liqPrice") or p.get("liquidationPrice")
-        line = f"• {sym} {side}  size={size}  entry={entry}  uPnL={upl}"
-        if liq:
-            line += f"  liq={liq}"
+        sym = str(p.get("symbol", "")).upper()
+        side = str(p.get("side", "")).upper()
+        size = p.get("size", "0")
+        entry = p.get("entryPrice", "") or p.get("entry_price", "")
+        upd = p.get("updatedTime") or p.get("updatedAt") or p.get("createdAt")
+        when = ""
+        if isinstance(upd, (int, float)) and upd > 10**12:
+            # epoch ms
+            dt = datetime.fromtimestamp(upd/1000, tz=timezone.utc)
+            when = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        elif isinstance(upd, (int, float)):
+            dt = datetime.fromtimestamp(upd, tz=timezone.utc)
+            when = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        line = f"- {sym} {side} size={size} entry={entry}"
+        if when:
+            line += f" updated={when}"
         lines.append(line)
     return "\n".join(lines)
 
+# State to avoid spamming
+_last_snapshot = None
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Discord
-# ──────────────────────────────────────────────────────────────────────────────
-def discord_post(content: str | None = None, embeds: list | None = None):
-    if not DISCORD_WEBHOOK:
-        return
-    payload = {}
-    if content:
-        payload["content"] = content[:1990]
-    if embeds:
-        payload["embeds"] = embeds
-    try:
-        rr = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
-        rr.raise_for_status()
-    except Exception as e:
-        logging.error("discord_post failed: %s", e)
+def poll_once():
+    global _last_snapshot
+    acct = fetch_account()
+    positions = extract_positions(acct)
+    # Build a stable snapshot string for dedupe
+    snapshot = "|".join(
+        f"{p.get('symbol','')}|{p.get('side','')}|{p.get('size','')}|{p.get('entryPrice') or p.get('entry_price') or ''}"
+        for p in sorted(positions, key=lambda x: (str(x.get('symbol','')), str(x.get('side','')), str(x.get('entryPrice') or x.get('entry_price') or '')))
+    )
+    if snapshot != _last_snapshot:
+        _last_snapshot = snapshot
+        body = "**Active ApeX Positions**\n" + format_positions(positions)
+        post_to_discord(body)
+        LOG.info(ascii_only(f"Posted {len(positions)} positions to Discord"))
+    else:
+        LOG.info(ascii_only("No position change"))
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Diagnostics & loop
-# ──────────────────────────────────────────────────────────────────────────────
 def diagnostics_once():
     try:
-        srv = _server_time_ms()
-        drift = srv - int(time.time() * 1000)
-        user = get_user()
-        acct = get_account()
-        pos = extract_positions(acct)
-        lines = [
-            "🧪 Diagnostics",
-            f"BASE_URL={BASE_URL}",
-            f"timestamp_mode=ms  drift={drift}ms  latency_pad={LATENCY_MS}ms",
-            f"/v3/user → code={user.get('code', 0)}",
-            f"/v3/account → code={acct.get('code', 0)}",
-            f"positions={len(pos)}",
-        ]
-        discord_post("\n".join(lines))
+        # GET /v3/time (server reachable?)
+        t = _get_server_time_seconds()
+        # GET /v3/account and /v3/user headers ok?
+        acct = fetch_account()
+        # Try user endpoint too (optional; ignore failures)
+        try:
+            resp_user = _request_private("GET", "/api/v3/user")
+            uok = resp_user.status_code
+        except Exception as ue:
+            uok = f"ERR {ue}"
+        positions = extract_positions(acct)
+        # Print minimal ASCII diag
+        LOG.info(ascii_only(f"Diagnostics: base={BASE_URL} serverTime={t} user={uok} positions={len(positions)}"))
+        post_to_discord(
+            "Bridge online.\n"
+            f"Base={BASE_URL}\n"
+            f"/v3/time ok, /v3/account ok, /v3/user={uok}\n"
+            f"Positions detected: {len(positions)}"
+        )
     except Exception as e:
-        discord_post(f"🧪 Diagnostics failed: {e}")
-
+        LOG.error(ascii_only(f"Diagnostics failed: {e}"))
 
 def main():
-    logging.info("Starting worker. BASE_URL=%s", BASE_URL)
-    if not (API_KEY and API_SECRET and PASSPHRASE and DISCORD_WEBHOOK):
-        logging.error("Missing required env: APEX_API_KEY, APEX_API_SECRET, APEX_API_PASSPHRASE, DISCORD_WEBHOOK")
-    sync_clock()
-    discord_post("ApeX → Discord bridge online. Using **ms** timestamps.")
+    LOG.info(ascii_only(f"Starting worker. BASE_URL={BASE_URL}"))
     diagnostics_once()
-
-    seen_fingerprints: set[str] = set()
     while True:
         try:
-            acct = get_account()
-            positions = extract_positions(acct)
-            # build a lightweight fingerprint to avoid spam
-            fp = json.dumps(sorted([(p.get("symbol"), p.get("side"), str(p.get("size"))) for p in positions]))
-            if fp not in seen_fingerprints:
-                seen_fingerprints.add(fp)
-                msg = f"**Active ApeX Positions**\n{format_positions(positions)}"
-                discord_post(msg)
+            poll_once()
         except Exception as e:
-            logging.error("%s", e)
-            discord_post(f"⚠️ {e}")
-        time.sleep(POLL_SECONDS)
-
+            LOG.error(ascii_only(f"Poll error: {e}"))
+        time.sleep(INTERVAL)
 
 if __name__ == "__main__":
-    logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s: %(message)s")
     main()
