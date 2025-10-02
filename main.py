@@ -1,4 +1,4 @@
-# main.py — ApeX Omni → Discord worker (v0.9 no-datetime)
+# main.py — ApeX Omni → Discord worker (v1.0 filtered active positions, no-datetime)
 #
 # Env (accepts both legacy and new names):
 #   APEX_API_KEY        or APEX_KEY
@@ -7,7 +7,8 @@
 #   DISCORD_WEBHOOK   (required)
 #   OMNI_BASE_URL or APEX_BASE_URL (default: https://omni.apex.exchange/api)
 #   INTERVAL_SECONDS (default 30)
-#   SCAN_SYMBOLS (optional, comma-separated)
+#   SCAN_SYMBOLS (optional, comma-separated, e.g. "BTC-USDT,ETH-USDT")
+#   APEX_MIN_POSITION_SIZE (default 1e-12)  # filter tiny/zero sizes
 #   APEX_LATENCY_CUSHION_MS (default 600)
 #   LOG_LEVEL (default INFO)
 
@@ -46,6 +47,7 @@ BASE_URL = (os.getenv("OMNI_BASE_URL") or os.getenv("APEX_BASE_URL") or "https:/
 INTERVAL = int(os.getenv("INTERVAL_SECONDS", "30"))
 SCAN_SYMBOLS = [s.strip().upper() for s in os.getenv("SCAN_SYMBOLS", "").split(",") if s.strip()]
 LATENCY_CUSHION_MS = int(os.getenv("APEX_LATENCY_CUSHION_MS", "600"))
+MIN_SIZE = float(os.getenv("APEX_MIN_POSITION_SIZE", "1e-12"))
 
 if not (API_KEY and API_SECRET and API_PASSPHRASE and DISCORD_WEBHOOK):
     LOG.error(ascii_only("Missing envs: APEX_API_KEY/APEX_KEY, APEX_API_SECRET/APEX_SECRET, APEX_API_PASSPHRASE/APEX_PASSPHRASE, DISCORD_WEBHOOK"))
@@ -56,11 +58,11 @@ session = requests.Session()
 retries = Retry(total=6, connect=6, read=6, backoff_factor=0.6, status_forcelist=(429, 500, 502, 503, 504))
 session.mount("https://", HTTPAdapter(max_retries=retries))
 session.mount("http://", HTTPAdapter(max_retries=retries))
-session.headers.update({"User-Agent": "apex-omni-discord-bridge/0.9"})
+session.headers.update({"User-Agent": "apex-omni-discord-bridge/1.0"})
 
-# ---------------- Time & signing ----------------
+# ---------------- Time & signing (no datetime) ----------------
 def get_server_time_seconds() -> int:
-    """GET /v3/time → epoch seconds (normalize if ms). No datetime used."""
+    """GET /v3/time → epoch seconds (normalize if ms)."""
     url = f"{BASE_URL}/v3/time"
     r = session.get(url, timeout=10)
     r.raise_for_status()
@@ -181,7 +183,26 @@ def post_discord(text: str):
     except Exception as e:
         LOG.error(ascii_only(f"Discord post failed: {e}"))
 
-# ---------------- Data helpers ----------------
+# ---------------- Utilities ----------------
+def _to_float(x) -> float:
+    try:
+        # handle strings like "0.00" or "1,234.5"
+        return float(str(x).replace(",", ""))
+    except Exception:
+        return 0.0
+
+def _norm_side(side_val, size_val) -> str:
+    s = (str(side_val or "")).upper()
+    if s in ("LONG", "SHORT"):
+        return s
+    # infer from sign if side missing/unknown
+    try:
+        f = float(size_val)
+        return "LONG" if f >= 0 else "SHORT"
+    except Exception:
+        return "LONG"
+
+# ---------------- Data fetch/parse ----------------
 def fetch_account() -> dict:
     r = private_request("GET", "/v3/account")
     try:
@@ -190,15 +211,20 @@ def fetch_account() -> dict:
         return {}
 
 def extract_positions(js: dict) -> list[dict]:
-    out = []
+    """
+    Return normalized, filtered positions:
+      {symbol:str, side:'LONG'|'SHORT', size:float, entry:float}
+    Filters out positions with abs(size) < MIN_SIZE.
+    """
+    raw = []
     if not isinstance(js, dict):
-        return out
+        return raw
 
     def take_list(dct: dict, key: str):
         if isinstance(dct.get(key), list):
-            out.extend(dct[key])
+            raw.extend(dct[key])
 
-    # top-level direct
+    # top-level
     take_list(js, "positions")
     take_list(js, "openPositions")
     ca = js.get("contractAccount") or {}
@@ -216,39 +242,74 @@ def extract_positions(js: dict) -> list[dict]:
             take_list(dca, "positions")
             take_list(dca, "openPositions")
 
-    # filter & dedupe (no datetime involved)
-    uniq = {}
-    for p in out:
+    # normalize + filter
+    out = []
+    for p in raw:
         try:
-            sym  = str(p.get("symbol") or p.get("contractSymbol") or p.get("market") or "").upper()
-            side = str(p.get("side") or p.get("positionSide") or "").upper()
-            size = str(p.get("size") or p.get("position") or p.get("quantity") or "")
-            entry = str(p.get("entryPrice") or p.get("avgEntryPrice") or p.get("avgPrice") or "")
-            if SCAN_SYMBOLS and sym not in SCAN_SYMBOLS:
+            symbol = str(p.get("symbol") or p.get("contractSymbol") or p.get("market") or "").upper()
+            if not symbol:
                 continue
-            uniq[(sym, side, size, entry)] = {"symbol": sym, "side": side, "size": size, "entry": entry}
+            if SCAN_SYMBOLS and symbol not in SCAN_SYMBOLS:
+                continue
+
+            # size may be 'size', 'quantity', 'position', etc.
+            size = None
+            for k in ("size", "positionSize", "position", "quantity", "qty"):
+                if k in p:
+                    size = _to_float(p.get(k))
+                    break
+            if size is None:
+                continue
+            if abs(size) < MIN_SIZE:
+                continue
+
+            side = _norm_side(p.get("side") or p.get("positionSide"), size)
+            entry = None
+            for ek in ("entryPrice", "avgEntryPrice", "avgPrice", "entry_price"):
+                if ek in p:
+                    entry = _to_float(p.get(ek))
+                    break
+            entry = 0.0 if entry is None else entry
+
+            out.append({"symbol": symbol, "side": side, "size": size, "entry": entry})
         except Exception:
-            # swallow any weird row; never crash loop
             continue
-    return list(uniq.values())
+
+    # dedupe identical lines (symbol, side, size, entry)
+    uniq = {}
+    for q in out:
+        key = (q["symbol"], q["side"], f"{q['size']:.12g}", f"{q['entry']:.12g}")
+        uniq[key] = q
+    out = list(uniq.values())
+    out.sort(key=lambda x: (x["symbol"], x["side"] != "LONG"))  # LONG first, then SHORT
+    return out
+
+# ---------------- Formatting ----------------
+def _fmt_num(x: float) -> str:
+    # compact but readable: up to 6 sig figs; no scientific for common sizes
+    try:
+        return f"{x:.6g}"
+    except Exception:
+        return str(x)
 
 def format_positions(pos: list[dict]) -> str:
     if not pos:
         return "No open positions"
-    lines = []
+    header = "SYMBOL         SIDE   SIZE         ENTRY"
+    sep    = "-------------  -----  -----------  ----------"
+    lines = [header, sep]
     for p in pos:
-        try:
-            lines.append(f"- {p['symbol']} {p['side']} size={p['size']} entry={p['entry']}")
-        except Exception:
-            pass
-    return "\n".join(lines)
+        lines.append(
+            f"{p['symbol']:<13}  {p['side']:<5}  {_fmt_num(p['size']):>11}  {_fmt_num(p['entry']):>10}"
+        )
+    return "```\n" + "\n".join(lines) + "\n```"
 
 # ---------------- Loop state ----------------
 _last_snapshot = None
 
 def snapshot_of(pos: list[dict]) -> str:
     try:
-        key_tuples = [(p.get("symbol",""), p.get("side",""), p.get("size",""), p.get("entry","")) for p in pos]
+        key_tuples = [(p["symbol"], p["side"], f"{p['size']:.10g}", f"{p['entry']:.10g}") for p in pos]
         key_tuples.sort()
         return json.dumps(key_tuples)
     except Exception:
@@ -261,10 +322,10 @@ def diagnostics_once():
         acct = fetch_account()
         positions = extract_positions(acct)
         post_discord(
-            "Bridge v0.9 (no-datetime) online.\n"
+            "Bridge v1.0 online (filtered).\n"
             f"Base={BASE_URL}\n"
             f"ServerTime(sec)={srv}\n"
-            f"Positions detected={len(positions)}"
+            f"Active positions detected={len(positions)}"
         )
     except Exception as e:
         LOG.error(ascii_only(f"Diagnostics failed: {e}"))
@@ -277,7 +338,7 @@ def poll_once():
     if snap != _last_snapshot:
         _last_snapshot = snap
         post_discord("Active ApeX Positions\n" + format_positions(positions))
-        LOG.info(ascii_only(f"Posted {len(positions)} positions"))
+        LOG.info(ascii_only(f"Posted {len(positions)} active positions"))
     else:
         LOG.info(ascii_only("No position change"))
 
