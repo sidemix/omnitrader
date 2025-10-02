@@ -1,8 +1,8 @@
 # main.py — ApeX Omni → Discord (Render worker)
-# Polls /api/v3/account and posts open positions to Discord embeds.
-# - Robust signing & retries
-# - Recursive detection of positions arrays (handles nesting)
-# - Throttled, de-duplicated Discord posts
+# - Signs v3 requests
+# - Diagnoses which wallet the key is bound to via /v3/user and /v3/account
+# - Finds positions anywhere in the payload (size / positionSize, etc.)
+# - Posts clean Discord embeds only when positions materially change
 
 import os
 import time
@@ -11,8 +11,8 @@ import hmac
 import hashlib
 import base64
 import logging
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
+from datetime import datetime, timezone
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -24,23 +24,19 @@ APEX_SECRET     = os.environ["APEX_SECRET"]            # raw secret string from 
 APEX_PASSPHRASE = os.environ["APEX_PASSPHRASE"]
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 
-# Omni mainnet by default. For testnet use: https://testnet.omni.apex.exchange/api
 BASE_URL  = os.environ.get("APEX_BASE_URL", "https://omni.apex.exchange/api").rstrip("/")
-
-# Polling & posting behavior
 POLL_SECS = int(os.environ.get("POLL_INTERVAL_SECS", "10"))
-MIN_POST_INTERVAL_SECS = int(os.environ.get("MIN_POST_INTERVAL_SECS", "60"))  # throttle updates
-POST_EMPTY_EVERY_SECS  = int(os.environ.get("POST_EMPTY_EVERY_SECS", "0"))    # 0 = only on transition
+MIN_POST_INTERVAL_SECS = int(os.environ.get("MIN_POST_INTERVAL_SECS", "60"))
+POST_EMPTY_EVERY_SECS  = int(os.environ.get("POST_EMPTY_EVERY_SECS", "0"))   # 0 = only on transition
 DEBUG = os.environ.get("DEBUG", "0") == "1"
 
-# Timestamp style (most setups work with ms). You can flip to ISO if needed: set APEX_TS_STYLE=iso
-TS_STYLE = os.environ.get("APEX_TS_STYLE", "ms").lower()  # "ms" or "iso"
+TS_STYLE = os.environ.get("APEX_TS_STYLE", "ms").lower()  # "ms" (default) or "iso"
 
 # ========= LOGGING =========
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logging.info("Starting worker. BASE_URL=%s", BASE_URL)
 
-# ========= HTTP SESSION (retries) =========
+# ========= HTTP session with retries =========
 session = requests.Session()
 retry = Retry(
     total=6, connect=6, read=6,
@@ -50,11 +46,10 @@ retry = Retry(
 )
 session.mount("https://", HTTPAdapter(max_retries=retry))
 
-# ========= SIGNING (Omni v3) =========
+# ========= Signing (Omni v3) =========
 def _timestamp() -> str:
     if TS_STYLE == "iso":
         return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    # default milliseconds since epoch
     return str(int(time.time() * 1000))
 
 def _data_string(data: Dict[str, Any] | None) -> str:
@@ -65,9 +60,9 @@ def _data_string(data: Dict[str, Any] | None) -> str:
 
 def _sign(path: str, method: str, ts: str, data: Dict[str, Any] | None = None) -> str:
     # Signature = Base64(HMAC_SHA256(Base64(secret), ts + METHOD + path + dataString))
-    message = ts + method.upper() + path + _data_string(data)
+    msg = ts + method.upper() + path + _data_string(data)
     key = base64.standard_b64encode(APEX_SECRET.encode("utf-8"))
-    digest = hmac.new(key, msg=message.encode("utf-8"), digestmod=hashlib.sha256).digest()
+    digest = hmac.new(key, msg=msg.encode("utf-8"), digestmod=hashlib.sha256).digest()
     return base64.standard_b64encode(digest).decode()
 
 def _headers(path: str, method: str, data: Dict[str, Any] | None = None) -> Dict[str, str]:
@@ -78,11 +73,10 @@ def _headers(path: str, method: str, data: Dict[str, Any] | None = None) -> Dict
         "APEX-PASSPHRASE": APEX_PASSPHRASE,
         "APEX-TIMESTAMP": ts,
         "APEX-SIGNATURE": sig,
-        # Content-Type not required for GET, but harmless:
         "Content-Type": "application/json",
     }
 
-# ========= DISCORD HELPERS =========
+# ========= Discord helpers =========
 def _post_discord_json(payload: Dict[str, Any]) -> None:
     try:
         session.post(DISCORD_WEBHOOK, json=payload, timeout=(10, 20))
@@ -92,7 +86,7 @@ def _post_discord_json(payload: Dict[str, Any]) -> None:
 def _post_text(text: str) -> None:
     _post_discord_json({"content": text})
 
-def _code_block_table(rows: List[str]) -> str:
+def _code_table(rows: List[str]) -> str:
     return "```\n" + "\n".join(rows) + "\n```"
 
 def _positions_embed(norm: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -119,13 +113,13 @@ def _positions_embed(norm: List[Dict[str, Any]]) -> Dict[str, Any]:
     color = 0x2ecc71 if total_upnl >= 0 else 0xe74c3c
     return {"embeds": [{
         "title": "Active ApeX Positions",
-        "description": _code_block_table(rows),
+        "description": _code_table(rows),
         "timestamp": ts,
         "color": color,
         "footer": {"text": "ApeX → Discord"},
     }]}
 
-# ========= API CALLS =========
+# ========= API calls =========
 def _get(path: str, params: Dict[str, Any] | None = None) -> Tuple[int, Dict[str, Any]]:
     url = f"{BASE_URL}{path}"
     hdrs = _headers(path, "GET")
@@ -142,11 +136,15 @@ def get_time_status() -> int:
     code, _ = _get("/v3/time")
     return code
 
+def get_user() -> Tuple[int, Dict[str, Any]]:
+    return _get("/v3/user")
+
 def get_account() -> Tuple[int, Dict[str, Any]]:
-    # This is the private endpoint that contains positions
     return _get("/v3/account")
 
-# ========= POSITION EXTRACTION =========
+# ========= Position extraction =========
+SIZE_KEYS = {"size", "positionSize", "qty", "quantity", "positionQty"}
+
 def _to_float(x: Any) -> float:
     try:
         return float(x)
@@ -156,11 +154,12 @@ def _to_float(x: Any) -> float:
 def _looks_like_position(item: Any) -> bool:
     if not isinstance(item, dict):
         return False
-    keys = {k.lower() for k in item.keys()}
-    return ("size" in keys) and ("symbol" in keys or "market" in keys)
+    lk = {k.lower() for k in item.keys()}
+    has_sym = ("symbol" in lk) or ("market" in lk)
+    has_size = any(k in lk for k in SIZE_KEYS)
+    return has_sym and has_size
 
 def _walk_positions(obj: Any, path: str = "$"):
-    """Yield (json_path, list_of_candidates) for arrays that look like positions."""
     if isinstance(obj, list):
         if obj and isinstance(obj[0], dict) and _looks_like_position(obj[0]):
             yield path, obj
@@ -170,19 +169,33 @@ def _walk_positions(obj: Any, path: str = "$"):
         for k, v in obj.items():
             yield from _walk_positions(v, f"{path}.{k}")
 
-def extract_open_positions(account_json: Dict[str, Any]) -> List[Dict[str, Any]]:
+def extract_open_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # Some responses may nest under "data" or "account"—normalize first
+    if isinstance(payload, dict) and "data" in payload and isinstance(payload["data"], dict):
+        acct = payload["data"]
+    else:
+        acct = payload
+
     best_path, best_list = None, []
-    for pth, lst in _walk_positions(account_json):
+    for pth, lst in _walk_positions(acct):
         if len(lst) > len(best_list):
             best_path, best_list = pth, lst
+
     if DEBUG:
         _post_text(f"🔎 found positions array at: `{best_path or '<none>'}` (len={len(best_list)})")
 
     open_pos: List[Dict[str, Any]] = []
     for item in best_list:
-        size = _to_float(item.get("size"))
+        # accept multiple size key spellings
+        size_val = None
+        for k in SIZE_KEYS:
+            if k in item:
+                size_val = item.get(k)
+                break
+        size = _to_float(size_val)
         if abs(size) <= 0:
-            continue  # ignore zero-size rows
+            continue
+
         sym   = (item.get("symbol") or item.get("market") or "?").replace("-", "").upper()
         side  = (item.get("side") or ("LONG" if size > 0 else "SHORT")).upper()
         entry = _to_float(item.get("entryPrice") or item.get("avgEntryPrice") or item.get("avgPrice"))
@@ -193,50 +206,73 @@ def extract_open_positions(account_json: Dict[str, Any]) -> List[Dict[str, Any]]
             "symbol": sym, "side": side, "size": size,
             "entry": entry, "mark": mark, "lev": lev, "uPnL": upl,
         })
+
     open_pos.sort(key=lambda x: (x["symbol"], x["side"]))
     return open_pos
 
-# ========= DIAGNOSTICS =========
+# ========= Diagnostics =========
+def _keys_preview(obj: Any, depth: int = 2) -> str:
+    """Return a short, safe preview of the top-level keys and shapes (no values)."""
+    try:
+        if isinstance(obj, dict):
+            lines = []
+            for k, v in list(obj.items())[:30]:
+                t = type(v).__name__
+                if isinstance(v, dict):
+                    lines.append(f"{k}: dict({len(v)})")
+                elif isinstance(v, list):
+                    inner = type(v[0]).__name__ if v else "empty"
+                    lines.append(f"{k}: list[{inner}]({len(v)})")
+                else:
+                    lines.append(f"{k}: {t}")
+            return "; ".join(lines) or "<empty dict>"
+        return type(obj).__name__
+    except Exception:
+        return "<uninspectable>"
+
 def diagnostics_once() -> None:
     try:
-        time_code = get_time_status()
+        tcode = get_time_status()
     except Exception as e:
-        time_code = f"err: {e}"
+        tcode = f"err: {e}"
 
-    code, data = get_account()
-    acct = data.get("data", data) if isinstance(data, dict) else {}
+    ucode, user = get_user()
+    acode, acct = get_account()
 
-    eth_addr = acct.get("ethereumAddress")
-    l2_key   = acct.get("l2Key")
-    acc_id   = acct.get("id")
-    top_pos  = acct.get("positions") or []
-    ca       = acct.get("contractAccount") or {}
-    ca_pos   = ca.get("positions") or []
+    # pull typical identity fields if present anywhere
+    def _pick(d: Dict[str, Any], k: str):
+        return d.get(k) or d.get("data", {}).get(k) or d.get("user", {}).get(k)
 
-    # scan tree for any array that looks like positions
-    scan_paths = []
-    for pth, arr in _walk_positions(acct, "$"):
-        scan_paths.append(f"{pth}[{len(arr)}]")
+    eth_addr = _pick(user, "ethereumAddress") or _pick(acct, "ethereumAddress")
+    l2_key   = _pick(user, "l2Key")           or _pick(acct, "l2Key")
+    acc_id   = _pick(user, "id")              or _pick(acct, "id")
+
+    # obvious position arrays, if any
+    top_pos = (acct.get("positions") or acct.get("data", {}).get("positions") or []) if isinstance(acct, dict) else []
+    ca_pos  = ((acct.get("contractAccount") or {}).get("positions") or []) if isinstance(acct, dict) else []
+
+    # compact previews of raw keys (no values)
+    user_keys = _keys_preview(user)
+    acct_keys = _keys_preview(acct)
 
     _post_text(
         "🧪 Diagnostics\n"
         f"BASE_URL={BASE_URL}\n"
-        f"GET /v3/time → {time_code} | GET /v3/account → {code}\n"
+        f"GET /v3/time → {tcode} | /v3/user → {ucode} | /v3/account → {acode}\n"
         f"ethereumAddress={eth_addr}\n"
         f"accountId={acc_id} | l2Key={l2_key}\n"
         f"positions(top)={len(top_pos)} | positions(contractAccount)={len(ca_pos)}\n"
-        f"scan:{', '.join(scan_paths) or '<none>'}"
+        f"userKeys: {user_keys}\n"
+        f"acctKeys: {acct_keys}"
     )
 
-
-
-# ========= MAIN LOOP =========
+# ========= Main loop =========
 _last_snapshot: str | None = None
 _last_post_ts = 0.0
 _last_empty_post_ts = 0.0
 _had_positions_last = False
 
-def should_post(norm: List[Dict[str, Any]], snap: str, now: float) -> bool:
+def _should_post(norm: List[Dict[str, Any]], snap: str, now: float) -> bool:
     global _last_snapshot, _last_post_ts, _last_empty_post_ts, _had_positions_last
     if norm:
         if snap != _last_snapshot and (now - _last_post_ts) >= MIN_POST_INTERVAL_SECS:
@@ -248,7 +284,7 @@ def should_post(norm: List[Dict[str, Any]], snap: str, now: float) -> bool:
             return True
     return False
 
-def record_post_state(norm: List[Dict[str, Any]], snap: str, now: float) -> None:
+def _record_post_state(norm: List[Dict[str, Any]], snap: str, now: float) -> None:
     global _last_snapshot, _last_post_ts, _last_empty_post_ts, _had_positions_last
     _last_post_ts = now
     _last_snapshot = snap if norm else "EMPTY"
@@ -257,21 +293,23 @@ def record_post_state(norm: List[Dict[str, Any]], snap: str, now: float) -> None
     _had_positions_last = bool(norm)
 
 def loop_once() -> None:
-    code, account = get_account()
-    if code != 200:
-        logging.error("HTTP %s on /v3/account", code)
+    # Fetch account (positions live here)
+    acode, acct = get_account()
+    if acode != 200:
+        logging.error("/v3/account HTTP %s", acode)
         if DEBUG:
-            _post_text(f"⚠️ /v3/account HTTP {code}")
+            _post_text(f"⚠️ /v3/account HTTP {acode}")
         return
-    norm = extract_open_positions(account)
+
+    norm = extract_open_positions(acct)
     snap = json.dumps(norm, sort_keys=True)
     now = time.time()
-    if should_post(norm, snap, now):
+
+    if _should_post(norm, snap, now):
         _post_discord_json(_positions_embed(norm))
-        record_post_state(norm, snap, now)
+        _record_post_state(norm, snap, now)
 
 if __name__ == "__main__":
-    # One-time diagnostics at boot
     diagnostics_once()
     while True:
         try:
