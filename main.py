@@ -1,8 +1,8 @@
 # main.py — ApeX Omni → Discord (Render worker)
-# - Signs v3 requests
-# - Diagnoses which wallet the key is bound to via /v3/user and /v3/account
-# - Finds positions anywhere in the payload (size / positionSize, etc.)
-# - Posts clean Discord embeds only when positions materially change
+# - Signs v3 requests (ISO/MS timestamp selectable; raw/base64 secret selectable)
+# - Calls /api/v3/user and /api/v3/account, surfaces API "code/msg" errors
+# - Recursively finds positions anywhere in the payload; filters zero-size
+# - Posts tidy Discord embeds only when positions actually change (with throttling)
 
 import os
 import time
@@ -11,7 +11,7 @@ import hmac
 import hashlib
 import base64
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 from datetime import datetime, timezone
 
 import requests
@@ -20,17 +20,22 @@ from urllib3.util.retry import Retry
 
 # ========= ENV =========
 APEX_KEY        = os.environ["APEX_KEY"]
-APEX_SECRET     = os.environ["APEX_SECRET"]            # raw secret string from Omni
+APEX_SECRET     = os.environ["APEX_SECRET"]            # raw secret string from Omni UI
 APEX_PASSPHRASE = os.environ["APEX_PASSPHRASE"]
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 
+# Omni mainnet by default. For testnet: https://testnet.omni.apex.exchange/api
 BASE_URL  = os.environ.get("APEX_BASE_URL", "https://omni.apex.exchange/api").rstrip("/")
+
+# Polling & posting behavior
 POLL_SECS = int(os.environ.get("POLL_INTERVAL_SECS", "10"))
-MIN_POST_INTERVAL_SECS = int(os.environ.get("MIN_POST_INTERVAL_SECS", "60"))
-POST_EMPTY_EVERY_SECS  = int(os.environ.get("POST_EMPTY_EVERY_SECS", "0"))   # 0 = only on transition
+MIN_POST_INTERVAL_SECS = int(os.environ.get("MIN_POST_INTERVAL_SECS", "60"))  # throttle updates
+POST_EMPTY_EVERY_SECS  = int(os.environ.get("POST_EMPTY_EVERY_SECS", "0"))    # 0 = only on transition
 DEBUG = os.environ.get("DEBUG", "0") == "1"
 
-TS_STYLE = os.environ.get("APEX_TS_STYLE", "ms").lower()  # "ms" (default) or "iso"
+# Timestamp / secret handling
+TS_STYLE = os.environ.get("APEX_TS_STYLE", "ms").lower()        # "ms" or "iso"
+APEX_SECRET_BASE64 = os.environ.get("APEX_SECRET_BASE64", "0") == "1"  # set to "1" if your secret is base64-encoded
 
 # ========= LOGGING =========
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -52,20 +57,20 @@ def _timestamp() -> str:
         return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     return str(int(time.time() * 1000))
 
-def _data_string(data: Dict[str, Any] | None) -> str:
+def _data_string(data: Optional[Dict[str, Any]]) -> str:
     if not data:
         return ""
     items = sorted((k, v) for k, v in data.items() if v is not None)
     return "&".join(f"{k}={v}" for k, v in items)
 
-def _sign(path: str, method: str, ts: str, data: Dict[str, Any] | None = None) -> str:
-    # Signature = Base64(HMAC_SHA256(Base64(secret), ts + METHOD + path + dataString))
+def _sign(path: str, method: str, ts: str, data: Optional[Dict[str, Any]] = None) -> str:
+    # Signature = Base64(HMAC_SHA256(secret_bytes, ts + METHOD + path + dataString))
     msg = ts + method.upper() + path + _data_string(data)
-    key = base64.standard_b64encode(APEX_SECRET.encode("utf-8"))
-    digest = hmac.new(key, msg=msg.encode("utf-8"), digestmod=hashlib.sha256).digest()
+    key_bytes = base64.b64decode(APEX_SECRET) if APEX_SECRET_BASE64 else APEX_SECRET.encode("utf-8")
+    digest = hmac.new(key_bytes, msg=msg.encode("utf-8"), digestmod=hashlib.sha256).digest()
     return base64.standard_b64encode(digest).decode()
 
-def _headers(path: str, method: str, data: Dict[str, Any] | None = None) -> Dict[str, str]:
+def _headers(path: str, method: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
     ts = _timestamp()
     sig = _sign(path, method, ts, data)
     return {
@@ -73,7 +78,7 @@ def _headers(path: str, method: str, data: Dict[str, Any] | None = None) -> Dict
         "APEX-PASSPHRASE": APEX_PASSPHRASE,
         "APEX-TIMESTAMP": ts,
         "APEX-SIGNATURE": sig,
-        "Content-Type": "application/json",
+        "Content-Type": "application/json",  # harmless for GET
     }
 
 # ========= Discord helpers =========
@@ -120,16 +125,23 @@ def _positions_embed(norm: List[Dict[str, Any]]) -> Dict[str, Any]:
     }]}
 
 # ========= API calls =========
-def _get(path: str, params: Dict[str, Any] | None = None) -> Tuple[int, Dict[str, Any]]:
+def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
     url = f"{BASE_URL}{path}"
     hdrs = _headers(path, "GET")
     r = session.get(url, headers=hdrs, params=params, timeout=(20, 30))
-    data = {}
     try:
-        if r.headers.get("content-type", "").startswith("application/json"):
-            data = r.json()
+        data = r.json()
     except Exception:
         data = {}
+
+    # Surface app-level errors (HTTP 200 with {"code":..., "msg":...})
+    api_code = data.get("code")
+    api_msg  = data.get("msg")
+    if api_code not in (None, 0):
+        logging.error("Omni API error on %s: code=%s msg=%s", path, api_code, api_msg)
+        if DEBUG:
+            _post_text(f"⚠️ Omni error {path}: code={api_code} msg={api_msg}")
+
     return r.status_code, data
 
 def get_time_status() -> int:
@@ -170,11 +182,8 @@ def _walk_positions(obj: Any, path: str = "$"):
             yield from _walk_positions(v, f"{path}.{k}")
 
 def extract_open_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    # Some responses may nest under "data" or "account"—normalize first
-    if isinstance(payload, dict) and "data" in payload and isinstance(payload["data"], dict):
-        acct = payload["data"]
-    else:
-        acct = payload
+    # Normalize if wrapped
+    acct = payload.get("data", payload) if isinstance(payload, dict) else payload
 
     best_path, best_list = None, []
     for pth, lst in _walk_positions(acct):
@@ -186,7 +195,7 @@ def extract_open_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     open_pos: List[Dict[str, Any]] = []
     for item in best_list:
-        # accept multiple size key spellings
+        # any recognized size key
         size_val = None
         for k in SIZE_KEYS:
             if k in item:
@@ -211,8 +220,7 @@ def extract_open_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return open_pos
 
 # ========= Diagnostics =========
-def _keys_preview(obj: Any, depth: int = 2) -> str:
-    """Return a short, safe preview of the top-level keys and shapes (no values)."""
+def _keys_preview(obj: Any) -> str:
     try:
         if isinstance(obj, dict):
             lines = []
@@ -239,7 +247,6 @@ def diagnostics_once() -> None:
     ucode, user = get_user()
     acode, acct = get_account()
 
-    # pull typical identity fields if present anywhere
     def _pick(d: Dict[str, Any], k: str):
         return d.get(k) or d.get("data", {}).get(k) or d.get("user", {}).get(k)
 
@@ -247,11 +254,9 @@ def diagnostics_once() -> None:
     l2_key   = _pick(user, "l2Key")           or _pick(acct, "l2Key")
     acc_id   = _pick(user, "id")              or _pick(acct, "id")
 
-    # obvious position arrays, if any
     top_pos = (acct.get("positions") or acct.get("data", {}).get("positions") or []) if isinstance(acct, dict) else []
     ca_pos  = ((acct.get("contractAccount") or {}).get("positions") or []) if isinstance(acct, dict) else []
 
-    # compact previews of raw keys (no values)
     user_keys = _keys_preview(user)
     acct_keys = _keys_preview(acct)
 
@@ -267,7 +272,7 @@ def diagnostics_once() -> None:
     )
 
 # ========= Main loop =========
-_last_snapshot: str | None = None
+_last_snapshot: Optional[str] = None
 _last_post_ts = 0.0
 _last_empty_post_ts = 0.0
 _had_positions_last = False
@@ -293,7 +298,6 @@ def _record_post_state(norm: List[Dict[str, Any]], snap: str, now: float) -> Non
     _had_positions_last = bool(norm)
 
 def loop_once() -> None:
-    # Fetch account (positions live here)
     acode, acct = get_account()
     if acode != 200:
         logging.error("/v3/account HTTP %s", acode)
