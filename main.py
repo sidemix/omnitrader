@@ -1,23 +1,27 @@
 # main.py — ApeX Omni → Discord worker
-# v1.3: mark fetch + PnL, rounded columns, update policy, no diagnostics post, no datetime()
+# v1.4: symbol-variant mark lookup + PnL, rounded columns, update policy,
+#       optional MARK_DEBUG, ASCII-safe logs, no datetime().
 #
-# Environment variables (accepts legacy names too):
-#   APEX_API_KEY        or APEX_KEY           (required)
-#   APEX_API_SECRET     or APEX_SECRET        (required)
-#   APEX_API_PASSPHRASE or APEX_PASSPHRASE    (required)
-#   DISCORD_WEBHOOK                          (required)
+# Required env (either legacy or new names work):
+#   APEX_API_KEY        or APEX_KEY
+#   APEX_API_SECRET     or APEX_SECRET
+#   APEX_API_PASSPHRASE or APEX_PASSPHRASE
+#   DISCORD_WEBHOOK
+#
+# Optional env:
 #   OMNI_BASE_URL or APEX_BASE_URL (default: https://omni.apex.exchange/api)
-#   INTERVAL_SECONDS           (default 30)
-#   SCAN_SYMBOLS               (optional CSV, e.g. "BTC-USDT,ETH-USDT")
-#   APEX_MIN_POSITION_SIZE     (default 1e-12)
-#   APEX_LATENCY_CUSHION_MS    (default 600)
-#   SIZE_DECIMALS              (default 4)
-#   PRICE_DECIMALS             (default 4)
-#   PNL_DECIMALS               (default 4)
-#   PNL_PCT_DECIMALS           (default 2)
-#   UPDATE_MODE                (openclose_only | positions_only[default] | any_change)
-#   SIZE_CHANGE_THRESHOLD      (default 0)  # e.g. 0.01 to ignore tiny size wobbles
-#   LOG_LEVEL                  (default INFO)
+#   INTERVAL_SECONDS (default 30)
+#   SCAN_SYMBOLS (CSV of symbols to include; default all)
+#   APEX_MIN_POSITION_SIZE (default 1e-12)
+#   APEX_LATENCY_CUSHION_MS (default 600)
+#   SIZE_DECIMALS (default 4)
+#   PRICE_DECIMALS (default 4)
+#   PNL_DECIMALS (default 4)
+#   PNL_PCT_DECIMALS (default 2)
+#   UPDATE_MODE = openclose_only | positions_only | any_change  (default positions_only)
+#   SIZE_CHANGE_THRESHOLD (default 0)  # e.g. 0.01 to ignore tiny size edits
+#   MARK_DEBUG = 1 to post mark-resolution debug info (default off)
+#   LOG_LEVEL (default INFO)
 #
 # Requires: requests
 
@@ -34,7 +38,8 @@ from urllib.parse import urlencode
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
-# ---------- logging (ASCII) ----------
+
+# ---------- logging (ASCII only to avoid codec issues) ----------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s: %(message)s",
@@ -47,13 +52,16 @@ def ascii_only(s: str) -> str:
     except Exception:
         return s
 
+
 # ---------- env ----------
 API_KEY        = os.getenv("APEX_API_KEY")        or os.getenv("APEX_KEY", "")
 API_SECRET     = os.getenv("APEX_API_SECRET")     or os.getenv("APEX_SECRET", "")
 API_PASSPHRASE = os.getenv("APEX_API_PASSPHRASE") or os.getenv("APEX_PASSPHRASE", "")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
+
 BASE_URL = (os.getenv("OMNI_BASE_URL") or os.getenv("APEX_BASE_URL") or "https://omni.apex.exchange/api").rstrip("/")
 INTERVAL = int(os.getenv("INTERVAL_SECONDS", "30"))
+
 SCAN_SYMBOLS = [s.strip().upper() for s in os.getenv("SCAN_SYMBOLS", "").split(",") if s.strip()]
 LATENCY_CUSHION_MS = int(os.getenv("APEX_LATENCY_CUSHION_MS", "600"))
 MIN_SIZE = float(os.getenv("APEX_MIN_POSITION_SIZE", "1e-12"))
@@ -65,19 +73,22 @@ PNL_PCT_DECIMALS = int(os.getenv("PNL_PCT_DECIMALS", "2"))
 
 UPDATE_MODE = os.getenv("UPDATE_MODE", "positions_only")  # openclose_only | positions_only | any_change
 SIZE_CHANGE_THRESHOLD = float(os.getenv("SIZE_CHANGE_THRESHOLD", "0"))
+MARK_DEBUG = os.getenv("MARK_DEBUG", "0") == "1"
 
 if not (API_KEY and API_SECRET and API_PASSPHRASE and DISCORD_WEBHOOK):
     LOG.error(ascii_only("Missing envs: APEX_API_KEY/APEX_KEY, APEX_API_SECRET/APEX_SECRET, APEX_API_PASSPHRASE/APEX_PASSPHRASE, DISCORD_WEBHOOK"))
     sys.exit(1)
 
-# ---------- http ----------
+
+# ---------- http session with retries ----------
 session = requests.Session()
 retries = Retry(total=6, connect=6, read=6, backoff_factor=0.6, status_forcelist=(429, 500, 502, 503, 504))
 session.mount("https://", HTTPAdapter(max_retries=retries))
 session.mount("http://", HTTPAdapter(max_retries=retries))
-session.headers.update({"User-Agent": "apex-omni-discord-bridge/1.3"})
+session.headers.update({"User-Agent": "apex-omni-discord-bridge/1.4"})
 
-# ---------- time & signing (no datetime) ----------
+
+# ---------- time + signing (no datetime() usage) ----------
 def get_server_time_seconds() -> int:
     url = f"{BASE_URL}/v3/time"
     r = session.get(url, timeout=10)
@@ -174,7 +185,8 @@ def private_request(method: str, path: str, params: dict | None = None, data: di
         raise last_err
     raise RuntimeError("Signing failed with all timestamp formats")
 
-# ---------- discord ----------
+
+# ---------- Discord ----------
 def post_discord(text: str):
     if not DISCORD_WEBHOOK:
         return
@@ -184,7 +196,8 @@ def post_discord(text: str):
     except Exception as e:
         LOG.error(ascii_only(f"Discord post failed: {e}"))
 
-# ---------- utils ----------
+
+# ---------- helpers ----------
 def _first(d: dict, *keys):
     for k in keys:
         if k in d and d[k] not in (None, ""):
@@ -220,12 +233,13 @@ def _fmt_pct(x, dec) -> str:
     except Exception:
         return "-"
 
-# ---------- symbol variants & public marks ----------
+
+# ---------- symbol variants & public mark lookups ----------
 def _symbol_variants(sym: str) -> list[str]:
-    """Return likely API forms for a market symbol."""
+    """Return likely API forms for a market symbol (dashed, undashed, etc.)."""
     s = (sym or "").upper()
     c = {s, s.replace("-", ""), s.replace("/", "")}
-    if s.endswith("-USDT"):               # APEX-USDT -> APEXUSDT
+    if s.endswith("-USDT"):                # APEX-USDT -> APEXUSDT
         c.add(s[:-5] + "USDT")
     if s.endswith("USDT") and "-" not in s:  # APEXUSDT -> APEX-USDT
         c.add(s[:-4] + "-USDT")
@@ -235,15 +249,17 @@ def fetch_marks(symbols: list[str]) -> dict[str, float]:
     """
     Best-effort mark/last price lookup. Tries batch and per-symbol endpoints
     and multiple symbol variants. Returns {DISPLAY_SYMBOL: price}.
+    If MARK_DEBUG=1, posts a short debug block to Discord with what hit.
     """
     out: dict[str, float] = {}
     if not symbols:
         return out
 
+    debug_lines = []
     wanted = {disp: _symbol_variants(disp) for disp in symbols}
     all_variants = sorted({v for vs in wanted.values() for v in vs})
 
-    def _maybe_take(js):
+    def _maybe_take(js, tag):
         buckets = []
         if isinstance(js, dict):
             if isinstance(js.get("data"), dict):
@@ -253,6 +269,7 @@ def fetch_marks(symbols: list[str]) -> dict[str, float]:
             for k in ("tickers", "list", "rows"):
                 if isinstance(js.get(k), list):
                     buckets.append(js[k])
+        took = []
         for arr in buckets:
             for row in arr:
                 try:
@@ -262,22 +279,28 @@ def fetch_marks(symbols: list[str]) -> dict[str, float]:
                         for disp, variants in wanted.items():
                             if sym in variants:
                                 out[disp] = px
+                                took.append((disp, sym, px))
                 except Exception:
                     continue
+        if MARK_DEBUG and took:
+            for disp, sym, px in took:
+                debug_lines.append(f"{tag}: {disp} <- {sym} = {px}")
 
-    # 1) Batch attempt
+    # 1) Batch
     try:
         r = session.get(f"{BASE_URL}/v3/market/tickers", params={"symbols": ",".join(all_variants)}, timeout=10)
         if r.ok:
-            _maybe_take(r.json())
-    except Exception:
-        pass
+            _maybe_take(r.json(), "batch/tickers")
+        elif MARK_DEBUG:
+            debug_lines.append(f"batch/tickers status={r.status_code}")
+    except Exception as e:
+        if MARK_DEBUG: debug_lines.append(f"batch/tickers err={e}")
 
     # 2) Per-symbol fallbacks
     for disp, variants in wanted.items():
         if disp in out:
             continue
-        found = False
+        got = False
         for var in variants:
             for path, param in (
                 ("/v3/market/ticker", "symbol"),
@@ -289,12 +312,11 @@ def fetch_marks(symbols: list[str]) -> dict[str, float]:
                 try:
                     r = session.get(f"{BASE_URL}{path}", params={param: var}, timeout=8)
                     if not r.ok:
+                        if MARK_DEBUG: debug_lines.append(f"{path}?{param}={var} status={r.status_code}")
                         continue
                     js = {}
-                    try:
-                        js = r.json()
-                    except Exception:
-                        js = {}
+                    try: js = r.json()
+                    except Exception: js = {}
                     px = None
                     if isinstance(js, dict) and isinstance(js.get("data"), dict):
                         px = _to_float(_first(js["data"], "markPrice", "lastPrice", "price", "indexPrice", "close"))
@@ -302,16 +324,23 @@ def fetch_marks(symbols: list[str]) -> dict[str, float]:
                         px = _to_float(_first(js, "markPrice", "lastPrice", "price", "indexPrice", "close"))
                     if px is not None:
                         out[disp] = px
-                        found = True
+                        if MARK_DEBUG: debug_lines.append(f"{path}?{param}={var} -> {disp}={px}")
+                        got = True
                         break
-                except Exception:
-                    continue
-            if found:
+                except Exception as e:
+                    if MARK_DEBUG: debug_lines.append(f"{path}?{param}={var} err={e}")
+            if got:
                 break
 
+    if MARK_DEBUG:
+        if out:
+            post_discord("```Mark debug\n" + "\n".join(debug_lines or ["no debug events"]) + "\nfound=" + str(out) + "\n```")
+        else:
+            post_discord("```Mark debug\nno marks found\ntried variants=" + ", ".join(all_variants) + "\n```")
     return out
 
-# ---------- data ----------
+
+# ---------- account + position normalization ----------
 def fetch_account() -> dict:
     r = private_request("GET", "/v3/account")
     try:
@@ -321,7 +350,7 @@ def fetch_account() -> dict:
 
 def extract_positions(js: dict) -> list[dict]:
     """
-    Normalize positions:
+    Normalize to:
       {symbol:str, side:'LONG'|'SHORT', size:float, entry:float|None,
        mark:float|None, pnl:float|None, pnl_pct:float|None}
     Filters out abs(size) < MIN_SIZE and applies SCAN_SYMBOLS if set.
@@ -397,7 +426,7 @@ def extract_positions(js: dict) -> list[dict]:
         if p.get("pnl_pct") is None and p.get("entry") not in (None, 0) and p.get("mark") is not None:
             p["pnl_pct"] = ((p["mark"] - p["entry"]) / p["entry"]) * 100.0 * sign
 
-    # Deduplicate (ignore mark/pnl changes for posting)
+    # Deduplicate (ignore mark/pnl-only diffs for posting unless UPDATE_MODE=any_change)
     uniq = {}
     for q in out:
         key = (q["symbol"], q["side"], f"{q['size']:.12g}", f"{(q['entry'] if q['entry'] is not None else 'None')}")
@@ -405,6 +434,7 @@ def extract_positions(js: dict) -> list[dict]:
     out = list(uniq.values())
     out.sort(key=lambda x: (x["symbol"], x["side"] != "LONG"))
     return out
+
 
 # ---------- formatting ----------
 def format_positions(pos: list[dict]) -> str:
@@ -423,6 +453,7 @@ def format_positions(pos: list[dict]) -> str:
             f"{p['symbol']:<13}  {p['side']:<5}  {size_s:>11}  {entry_s:>12}  {mark_s:>12}  {pnl_s:>10}  {pnlp_s:>5}"
         )
     return "```\n" + "\n".join(lines) + "\n```"
+
 
 # ---------- update policy ----------
 def _quantize_size(x: float) -> float:
@@ -468,6 +499,7 @@ def snapshot_of(pos: list[dict]) -> str:
         return json.dumps(keys)
     except Exception:
         return ""
+
 
 # ---------- loop ----------
 _last_snapshot = None
