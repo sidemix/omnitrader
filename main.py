@@ -1,8 +1,8 @@
 # main.py — ApeX Omni → Discord (Render worker)
-# - Signs v3 requests (ISO/MS timestamp selectable; raw/base64 secret selectable)
-# - Calls /api/v3/user and /api/v3/account, surfaces API "code/msg" errors
-# - Recursively finds positions anywhere in the payload; filters zero-size
-# - Posts tidy Discord embeds only when positions actually change (with throttling)
+# - Uses server time sync for APEX-TIMESTAMP (solves err APEX-TIMESTAMP)
+# - Signs v3 requests; surfaces API "code/msg" errors
+# - Recursively finds positions anywhere in payload; filters zero-size
+# - Posts tidy Discord embeds only when positions actually change
 
 import os
 import time
@@ -34,8 +34,8 @@ POST_EMPTY_EVERY_SECS  = int(os.environ.get("POST_EMPTY_EVERY_SECS", "0"))    # 
 DEBUG = os.environ.get("DEBUG", "0") == "1"
 
 # Timestamp / secret handling
-TS_STYLE = os.environ.get("APEX_TS_STYLE", "ms").lower()        # "ms" or "iso"
-APEX_SECRET_BASE64 = os.environ.get("APEX_SECRET_BASE64", "0") == "1"  # set to "1" if your secret is base64-encoded
+TS_STYLE = os.environ.get("APEX_TS_STYLE", "ms").lower()        # "ms" or "iso" (ms recommended)
+APEX_SECRET_BASE64 = os.environ.get("APEX_SECRET_BASE64", "0") == "1"  # set to "1" if your secret is Base64
 
 # ========= LOGGING =========
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -51,12 +51,96 @@ retry = Retry(
 )
 session.mount("https://", HTTPAdapter(max_retries=retry))
 
-# ========= Signing (Omni v3) =========
-def _timestamp() -> str:
-    if TS_STYLE == "iso":
-        return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    return str(int(time.time() * 1000))
+# ========= Server time sync (for APEX-TIMESTAMP) =========
+_server_offset_ms = 0  # server_ms - local_ms
 
+def _parse_server_time_to_ms(payload: Dict[str, Any]) -> Optional[int]:
+    """
+    Try to extract server time (ms since epoch) from /v3/time response.
+    Accepts a variety of shapes: {"data":{"serverTime": 169...}}, {"serverTime": "2025-10-02T...Z"}, etc.
+    """
+    candidate = None
+    d = payload or {}
+    # common places
+    if "data" in d and isinstance(d["data"], dict):
+        dd = d["data"]
+        candidate = dd.get("serverTime") or dd.get("timestamp") or dd.get("time") or dd.get("now")
+    if candidate is None:
+        candidate = d.get("serverTime") or d.get("timestamp") or d.get("time") or d.get("now")
+
+    if candidate is None:
+        return None
+
+    # numeric seconds or milliseconds
+    try:
+        val = float(candidate)
+        if val > 1e12:  # looks like ms
+            return int(val)
+        elif val > 1e9:  # looks like seconds
+            return int(val * 1000)
+    except Exception:
+        pass
+
+    # ISO string fallback
+    try:
+        s = str(candidate)
+        # normalize Z → +00:00 for fromisoformat
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return None
+
+def sync_server_time() -> None:
+    """Fetch /v3/time and compute offset so that APEX-TIMESTAMP is within tolerance."""
+    global _server_offset_ms
+    try:
+        r = session.get(f"{BASE_URL}/v3/time", timeout=(10, 10))
+        r.raise_for_status()
+        data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+    except Exception as e:
+        logging.warning("Failed to fetch /v3/time: %s", e)
+        return
+
+    server_ms = _parse_server_time_to_ms(data)
+    if server_ms is None:
+        logging.warning("Could not parse server time from /v3/time response: %s", data)
+        return
+
+    local_ms = int(time.time() * 1000)
+    _server_offset_ms = server_ms - local_ms
+    if DEBUG:
+        try:
+            _post_text(f"⏱ synced server time: server_ms={server_ms} local_ms={local_ms} offset_ms={_server_offset_ms}")
+        except Exception:
+            pass
+
+# Initial sync at boot, then we’ll re-sync periodically
+sync_server_time()
+_last_sync = time.time()
+
+def _timestamp() -> str:
+    """
+    Produce APEX-TIMESTAMP using server offset.
+    - "ms": epoch milliseconds (string)
+    - "iso": ISO 8601 with Z
+    """
+    global _last_sync
+    now = time.time()
+    if now - _last_sync > 300:  # re-sync every 5 minutes
+        sync_server_time()
+        _last_sync = now
+
+    ms = int(time.time() * 1000) + _server_offset_ms
+    if TS_STYLE == "iso":
+        # Convert ms to ISO Z
+        dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+        return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    else:
+        return str(ms)
+
+# ========= Signing (Omni v3) =========
 def _data_string(data: Optional[Dict[str, Any]]) -> str:
     if not data:
         return ""
@@ -133,7 +217,6 @@ def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[
         data = r.json()
     except Exception:
         data = {}
-
     # Surface app-level errors (HTTP 200 with {"code":..., "msg":...})
     api_code = data.get("code")
     api_msg  = data.get("msg")
@@ -141,7 +224,6 @@ def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[
         logging.error("Omni API error on %s: code=%s msg=%s", path, api_code, api_msg)
         if DEBUG:
             _post_text(f"⚠️ Omni error {path}: code={api_code} msg={api_msg}")
-
     return r.status_code, data
 
 def get_time_status() -> int:
