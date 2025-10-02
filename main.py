@@ -1,6 +1,8 @@
-# main.py — ApeX Omni → Discord (24/7 Render worker)
-# - Polls active positions and posts to a Discord channel
-# - Built-in retries, backoff, diagnostics, and snapshot-diff to avoid spam
+# main.py — ApeX (Omni/Pro) → Discord notifier (Render worker)
+# - Robust retries
+# - Auto-picks first reachable BASE URL from a candidate list
+# - Snapshot diff to avoid spam
+# - One-shot diagnostics to Discord on boot
 
 import os
 import time
@@ -15,92 +17,121 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ---------- Config via ENV ----------
-# REQUIRED
+# -------- ENV --------
 APEX_KEY        = os.environ["APEX_KEY"]
-APEX_SECRET     = os.environ["APEX_SECRET"].encode()            # keep bytes for HMAC
-APEX_PASSPHRASE = os.environ["APEX_PASSPHRASE"]
+APEX_SECRET     = os.environ["APEX_SECRET"].encode()            # bytes for HMAC
+APEX_PASSPHRASE = os.environ.get("APEX_PASSPHRASE", "")
+APEX_ACCOUNT_ID = os.environ.get("APEX_ACCOUNT_ID", "").strip()
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 
-# OPTIONAL (but nice to have if Omni expects it)
-APEX_ACCOUNT_ID = os.environ.get("APEX_ACCOUNT_ID", "").strip()
+# Accept comma-separated candidates; first working one is used.
+# You can override in Render → Environment without code changes.
+APEX_BASE_URLS  = os.environ.get(
+    "APEX_BASE_URLS",
+    "https://api.omni.apex.exchange,https://api.pro.apex.exchange,https://api.apex.exchange"
+)
 
-# You can change these in Render → Environment without redeploying code
-BASE_URL  = os.environ.get("APEX_BASE_URL", "https://api.omni.apex.exchange").rstrip("/")
-POS_PATH  = os.environ.get("APEX_POSITIONS_PATH", "/v1/account/positions")  # override if docs differ
+POS_PATH  = os.environ.get("APEX_POSITIONS_PATH", "/v1/account/positions")
 POLL_SECS = int(os.environ.get("POLL_INTERVAL_SECS", "10"))
 
-# ---------- Logging ----------
+# -------- Logging --------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-# ---------- HTTP session with retries ----------
+# -------- HTTP session with retries --------
 session = requests.Session()
 retry = Retry(
-    total=6,
-    connect=6,
-    read=6,
-    backoff_factor=1.5,                     # 0s, 1.5s, 3s, 4.5s, ...
+    total=6, connect=6, read=6,
+    backoff_factor=1.5,
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["GET", "POST"],
-    raise_on_status=False,
+    raise_on_status=False
 )
 session.mount("https://", HTTPAdapter(max_retries=retry))
 session.mount("http://",  HTTPAdapter(max_retries=retry))
 
-# ---------- Helpers ----------
-def sign(path: str, method: str, body: str = ""):
-    """
-    ApeX signature (typical): ts + method + path + body  -> HMAC-SHA256(secret)
-    Adjust here if your Omni docs specify a different payload.
-    """
-    ts = str(int(time.time() * 1000))
-    payload = ts + method.upper() + path + body
-    sig = hmac.new(APEX_SECRET, payload.encode(), hashlib.sha256).hexdigest()
-    return ts, sig
+# -------- Utilities --------
+def _chunks(s: str, n: int):
+    for i in range(0, len(s), n):
+        yield s[i:i+n]
 
-def apex_headers(ts: str, sig: str):
-    # Common headers; include passphrase and (optionally) account id if present
-    headers = {
-        "APEX-KEY": APEX_KEY,
-        "APEX-SIGN": sig,
-        "APEX-TS": ts,
-        "APEX-PASSPHRASE": APEX_PASSPHRASE,
-        "Content-Type": "application/json",
-    }
-    if APEX_ACCOUNT_ID:
-        headers["APEX-ACCOUNT-ID"] = APEX_ACCOUNT_ID
-    return headers
-
-def get_open_positions():
-    path = POS_PATH
-    ts, sig = sign(path, "GET")
-    headers = apex_headers(ts, sig)
-    # Longer (connect, read) timeouts to be resilient on cold networks
-    r = session.get(BASE_URL + path, headers=headers, timeout=(20, 30))
-    r.raise_for_status()
-    return r.json()
-
-def post_to_discord(lines):
-    if not lines:
+def post_to_discord(lines_or_text):
+    """Send one or multiple lines to Discord safely."""
+    if not lines_or_text:
         return
-    # Discord message content limit is ~2000 chars; chunk if needed
-    content = "🟢 **Active ApeX Positions** ({})\n{}".format(
-        datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ'),
-        "\n".join(lines),
-    )
+    if isinstance(lines_or_text, str):
+        text = lines_or_text
+    else:
+        text = "\n".join(lines_or_text)
+    content = text
     for chunk in _chunks(content, 1900):
         try:
             session.post(DISCORD_WEBHOOK, json={"content": chunk}, timeout=(10, 20))
         except Exception as e:
             logging.error("Discord post failed: %s", e)
 
-def _chunks(s: str, n: int):
-    for i in range(0, len(s), n):
-        yield s[i:i+n]
+def _resolve_host(host: str):
+    """Return unique IPs resolved for a host (or [])."""
+    try:
+        addrs = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+        return list({a[4][0] for a in addrs})
+    except Exception:
+        return []
+
+def pick_working_base_url(candidates):
+    """Try each base URL: DNS and then a quick GET to /v1/ping or /v1/time."""
+    tried = []
+    for raw in candidates:
+        base = raw.strip().rstrip("/")
+        if not base:
+            continue
+        host = base.split("://",1)[1].split("/",1)[0]
+        ips = _resolve_host(host)
+        tried.append(f"{base} DNS={ips or 'N/A'}")
+        if not ips:
+            continue
+        # probe a couple common endpoints quickly
+        for probe in ("/v1/ping", "/v1/time", "/"):
+            url = base + probe
+            try:
+                r = session.get(url, timeout=(5, 8))
+                # Any 2xx/3xx/4xx means TCP+TLS+HTTP OK; 5xx may still be OK
+                if r.status_code >= 200:
+                    logging.info("Base URL selected: %s (probe %s -> %s)", base, probe, r.status_code)
+                    return base, tried
+            except Exception as e:
+                logging.warning("Probe failed %s: %s", url, e)
+                continue
+    return None, tried
+
+def sign(path: str, method: str, body: str = ""):
+    """Signature: ts + METHOD + path + body (adjust if ApeX spec differs)."""
+    ts = str(int(time.time() * 1000))
+    payload = ts + method.upper() + path + body
+    sig = hmac.new(APEX_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+    return ts, sig
+
+def apex_headers(ts: str, sig: str):
+    headers = {
+        "APEX-KEY": APEX_KEY,
+        "APEX-SIGN": sig,
+        "APEX-TS": ts,
+        "Content-Type": "application/json",
+    }
+    if APEX_PASSPHRASE:
+        headers["APEX-PASSPHRASE"] = APEX_PASSPHRASE
+    if APEX_ACCOUNT_ID:
+        headers["APEX-ACCOUNT-ID"] = APEX_ACCOUNT_ID
+    return headers
+
+def get_open_positions(base_url: str):
+    ts, sig = sign(POS_PATH, "GET")
+    headers = apex_headers(ts, sig)
+    r = session.get(base_url + POS_PATH, headers=headers, timeout=(20, 30))
+    r.raise_for_status()
+    return r.json()
 
 def build_lines(positions):
     out = []
-    # positions could be under {"positions": [...]} or just a list; normalize:
     items = positions.get("positions", positions) if isinstance(positions, dict) else positions
     for p in items or []:
         sym   = p.get("symbol") or p.get("market") or "?"
@@ -113,56 +144,58 @@ def build_lines(positions):
         out.append(f"**{sym}** — {side} | size: {sz} | entry: {entry} | mark: {mark} | lev: {lev} | uPnL: {upnl}")
     if not out:
         out.append("_No open positions_")
+    # Prefix with timestamp
+    out.insert(0, f"🟢 **Active ApeX Positions** ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')})")
     return out
 
-def diag():
-    """One-shot diagnostics posted to Discord so you can confirm connectivity & egress IP."""
-    lines = [f"🔧 **Diagnostics** BASE_URL=`{BASE_URL}` PATH=`{POS_PATH}`"]
+def diag(selected_base: str, tried_list):
+    lines = [f"🔧 **Diagnostics**\nPath: `{POS_PATH}`\nCandidates: {APEX_BASE_URLS}"]
     # Egress IP
     try:
         ip = session.get("https://api.ipify.org", timeout=(5,10)).text
         lines.append(f"Egress IP: `{ip}`")
     except Exception as e:
         lines.append(f"Egress IP check failed: `{e}`")
-    # DNS
-    try:
-        host = BASE_URL.split("://",1)[1].split("/",1)[0]
-        addrs = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
-        addrs = list({a[4][0] for a in addrs})
-        lines.append(f"DNS {host} → {addrs}")
-    except Exception as e:
-        lines.append(f"DNS failed: `{e}`")
-    # Generic HTTPS sanity
-    try:
-        session.get("https://www.google.com", timeout=(5,10))
-        lines.append("HTTPS to google.com: OK")
-    except Exception as e:
-        lines.append(f"HTTPS to google.com FAILED: `{e}`")
-    # ApeX reachability (try a couple of common paths)
-    tried = ["/v1/ping", "/v1/time", POS_PATH]
-    for p in tried:
-        try:
-            session.get(BASE_URL + p, timeout=(10,10))
-            lines.append(f"ApeX reachability OK: `{p}`")
-            break
-        except Exception as e:
-            lines.append(f"ApeX `{p}` FAILED: `{e}`")
+    # What we tried
+    for t in tried_list:
+        lines.append(f"Tried: {t}")
+    # Result
+    if selected_base:
+        lines.append(f"✅ Selected BASE_URL: `{selected_base}`")
+    else:
+        lines.append("❌ No candidate resolved/responded.")
     post_to_discord(lines)
 
-# ---------- Main loop ----------
+# -------- Main --------
 if __name__ == "__main__":
-    logging.info("Starting worker. BASE_URL=%s", BASE_URL)
-    # One-shot heartbeat/diagnostic
+    # Choose a reachable base URL
+    candidates = [c for c in APEX_BASE_URLS.split(",")]
+    base_url, tried = pick_working_base_url(candidates)
+    logging.info("Base URL choice: %s", base_url or "NONE")
+
+    # Post diagnostics once
     try:
-        diag()
+        diag(base_url, tried)
     except Exception as e:
         logging.warning("Diagnostics failed: %s", e)
+
+    if not base_url:
+        # Sleep & retry periodically so the worker stays up if DNS/egress changes
+        while True:
+            logging.error("No reachable ApeX base URL from candidates; will retry in 60s.")
+            time.sleep(60)
+            base_url, tried = pick_working_base_url(candidates)
+            if base_url:
+                try:
+                    diag(base_url, tried)
+                except Exception:
+                    pass
+                break
 
     last_snapshot = None
     while True:
         try:
-            data = get_open_positions()
-            # Only post when positions actually change
+            data = get_open_positions(base_url)
             snap = json.dumps(data, sort_keys=True, default=str)
             if snap != last_snapshot:
                 post_to_discord(build_lines(data))
@@ -172,7 +205,6 @@ if __name__ == "__main__":
         except requests.exceptions.ReadTimeout as e:
             logging.warning("Read timeout: %s", e)
         except requests.exceptions.HTTPError as e:
-            # Log body for easier debugging
             try:
                 logging.error("HTTP %s: %s", e.response.status_code, e.response.text)
             except Exception:
