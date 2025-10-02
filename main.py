@@ -1,8 +1,11 @@
 # main.py — ApeX Omni → Discord (Render worker)
-# - Server time sync (+ latency cushion) to satisfy APEX-TIMESTAMP requirements
-# - Auto-negotiates timestamp style (iso -> ms -> s); rejects "TIMESTAMP"/"expired"/signature/auth errors
-# - Signs v3: HMAC key = Base64(secret-utf8), msg = ts + METHOD + path + dataString, sig = Base64(HMAC-SHA256)
-# - Surfaces API "code/msg"
+# - Server time sync (+ configurable latency cushion) for APEX-TIMESTAMP
+# - Negotiates timestamp style: ISO first, then MS (never seconds)
+# - Signs v3 per docs:
+#     key = Base64(secret-utf8)
+#     message = timestamp + METHOD + path + dataString
+#     signature = Base64(HMAC_SHA256(key, message))
+# - Surfaces API "code/msg" errors
 # - Recursively finds positions; filters zero-size
 # - Posts clean Discord embeds only when positions change
 
@@ -32,11 +35,12 @@ BASE_URL  = os.environ.get("APEX_BASE_URL", "https://omni.apex.exchange/api").rs
 # Polling & posting behavior
 POLL_SECS = int(os.environ.get("POLL_INTERVAL_SECS", "10"))
 MIN_POST_INTERVAL_SECS = int(os.environ.get("MIN_POST_INTERVAL_SECS", "60"))
-POST_EMPTY_EVERY_SECS  = int(os.environ.get("POST_EMPTY_EVERY_SECS", "0"))    # 0 = only on transition
+POST_EMPTY_EVERY_SECS  = int(os.environ.get("POST_EMPTY_EVERY_SECS", "0"))  # 0 = only on transition
 DEBUG = os.environ.get("DEBUG", "0") == "1"
 
-# Optional preference for negotiation (leave blank to auto)
-FORCE_TS_STYLE = os.environ.get("APEX_TS_STYLE", "").lower()   # "", "iso", "ms", "s"
+# Prefer a specific ts style? (leave blank to allow negotiation)
+FORCE_TS_STYLE = os.environ.get("APEX_TS_STYLE", "").lower()   # "", "iso", "ms"
+LATENCY_MS     = int(os.environ.get("APEX_LATENCY_CUSHION_MS", "600"))
 
 # ========= LOGGING =========
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -53,7 +57,7 @@ retry = Retry(
 session.mount("https://", HTTPAdapter(max_retries=retry))
 
 # ========= Globals chosen by negotiation =========
-TS_STYLE_ACTIVE = "iso"          # one of: "iso", "ms", "s" (we prefer ISO first)
+TS_STYLE_ACTIVE = "iso"          # "iso" or "ms"
 _server_offset_ms = 0            # server_ms - local_ms
 
 # ========= Discord helpers =========
@@ -157,15 +161,14 @@ def _ts_value(style: str) -> str:
         sync_server_time()
         _last_sync = now
 
-    # base value from synced server time (+ small latency cushion)
-    ms = int(time.time() * 1000) + _server_offset_ms + 300
+    # base value from synced server time (+ latency cushion)
+    ms = int(time.time() * 1000) + _server_offset_ms + LATENCY_MS
 
     if style == "iso":
         dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
         return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    if style == "s":
-        return str(int(ms / 1000))
-    return str(ms)  # "ms"
+    # style == "ms"
+    return str(ms)
 
 # ========= Signing (Omni v3) =========
 def _data_string(data: Optional[Dict[str, Any]]) -> str:
@@ -192,7 +195,7 @@ def _headers(ts_style: str, path: str, method: str, data: Optional[Dict[str, Any
         "Content-Type": "application/json",
     }
 
-# ========= Low-level GET with chosen combo =========
+# ========= Low-level GET with chosen ts =========
 def _get_with_ts(ts_style: str, path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
     url = f"{BASE_URL}{path}"
     hdrs = _headers(ts_style, path, "GET", None)
@@ -209,38 +212,30 @@ def _api_error_code_msg(data: Dict[str, Any]) -> Tuple[Optional[int], Optional[s
 # ========= Negotiation (timestamp style) =========
 def negotiate_ts_style() -> None:
     global TS_STYLE_ACTIVE
-    ts_candidates: List[str] = []
-    if FORCE_TS_STYLE in ("iso", "ms", "s"):
-        ts_candidates.append(FORCE_TS_STYLE)
-    # prefer iso first
-    for s in ("iso", "ms", "s"):
-        if s not in ts_candidates:
-            ts_candidates.append(s)
+    if FORCE_TS_STYLE in ("iso", "ms"):
+        TS_STYLE_ACTIVE = FORCE_TS_STYLE
+        if DEBUG:
+            _post_text(f"✅ Forced ts={TS_STYLE_ACTIVE}")
+        return
 
-    for ts in ts_candidates:
+    # Try ISO then MS ONLY (never seconds)
+    for ts in ("iso", "ms"):
         code, data = _get_with_ts(ts, "/v3/user")
         api_code, api_msg = _api_error_code_msg(data)
         msg_up = (str(api_msg) or "").upper()
 
-        # Reject obvious failures
-        bad = False
-        if api_code is not None:
-            if api_code in (20002, 20009):
-                bad = True  # timestamp format / expired window
-            if any(k in msg_up for k in ("TIMESTAMP", "EXPIRED", "SIGNATURE", "AUTH")):
-                bad = True
-        if bad:
+        # Reject if timestamp/signature/auth issues
+        if api_code in (20002, 20009) or any(k in msg_up for k in ("TIMESTAMP", "EXPIRED", "SIGNATURE", "AUTH")):
             continue
 
-        # Accept this ts style
         TS_STYLE_ACTIVE = ts
         if DEBUG:
-            _post_text(f"✅ Selected auth combo: ts={TS_STYLE_ACTIVE} (probe code={api_code} msg={api_msg})")
+            _post_text(f"✅ Selected ts={TS_STYLE_ACTIVE} (probe code={api_code} msg={api_msg})")
         return
 
-    # Fallback
-    TS_STYLE_ACTIVE = ts_candidates[0]
-    _post_text(f"⚠️ Could not negotiate; falling back to ts={TS_STYLE_ACTIVE}")
+    # Fallback to ISO
+    TS_STYLE_ACTIVE = "iso"
+    _post_text("⚠️ Negotiation failed; forcing ts=iso")
 
 negotiate_ts_style()
 
