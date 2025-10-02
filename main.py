@@ -202,19 +202,34 @@ def diagnostics_once() -> None:
         time_code = get_time_status()
     except Exception as e:
         time_code = f"err: {e}"
+
     code, data = get_account()
-    tops = len(data.get("positions") or []) if isinstance(data, dict) else 0
-    nested = 0
-    try:
-        nested = len((data.get("contractAccount") or {}).get("positions") or [])
-    except Exception:
-        pass
-    _post_text(
+    # unwrap common envelope
+    acct = data.get("data", data) if isinstance(data, dict) else {}
+    # pull a few IDs to compare with your UI
+    eth = acct.get("ethereumAddress")
+    l2  = acct.get("l2Key")
+    acc_id = acct.get("id")
+    # try the obvious position paths
+    top_pos = acct.get("positions") or []
+    ca = acct.get("contractAccount") or {}
+    ca_pos = ca.get("positions") or []
+    # count any array in the tree that "looks like" positions
+    any_pos_paths = []
+    for pth, arr in _walk_positions(acct, "$"):
+        any_pos_paths.append(f"{pth}[{len(arr)}]")
+
+    msg = (
         "🧪 Diagnostics\n"
         f"BASE_URL={BASE_URL}\n"
         f"GET /v3/time → {time_code} | GET /v3/account → {code}\n"
-        f"positions(top)={tops} | positions(contractAccount)={nested}"
+        f"ethereumAddress={eth}\n"
+        f"accountId={acc_id} | l2Key={l2}\n"
+        f"positions(top)={len(top_pos)} | positions(contractAccount)={len(ca_pos)}\n"
+        f"scan:{', '.join(any_pos_paths) or '<none>'}"
     )
+    _post_text(msg)
+
 
 # ========= MAIN LOOP =========
 _last_snapshot: str | None = None
