@@ -204,31 +204,30 @@ def diagnostics_once() -> None:
         time_code = f"err: {e}"
 
     code, data = get_account()
-    # unwrap common envelope
     acct = data.get("data", data) if isinstance(data, dict) else {}
-    # pull a few IDs to compare with your UI
-    eth = acct.get("ethereumAddress")
-    l2  = acct.get("l2Key")
-    acc_id = acct.get("id")
-    # try the obvious position paths
-    top_pos = acct.get("positions") or []
-    ca = acct.get("contractAccount") or {}
-    ca_pos = ca.get("positions") or []
-    # count any array in the tree that "looks like" positions
-    any_pos_paths = []
-    for pth, arr in _walk_positions(acct, "$"):
-        any_pos_paths.append(f"{pth}[{len(arr)}]")
 
-    msg = (
+    eth_addr = acct.get("ethereumAddress")
+    l2_key   = acct.get("l2Key")
+    acc_id   = acct.get("id")
+    top_pos  = acct.get("positions") or []
+    ca       = acct.get("contractAccount") or {}
+    ca_pos   = ca.get("positions") or []
+
+    # scan tree for any array that looks like positions
+    scan_paths = []
+    for pth, arr in _walk_positions(acct, "$"):
+        scan_paths.append(f"{pth}[{len(arr)}]")
+
+    _post_text(
         "🧪 Diagnostics\n"
         f"BASE_URL={BASE_URL}\n"
         f"GET /v3/time → {time_code} | GET /v3/account → {code}\n"
-        f"ethereumAddress={eth}\n"
-        f"accountId={acc_id} | l2Key={l2}\n"
+        f"ethereumAddress={eth_addr}\n"
+        f"accountId={acc_id} | l2Key={l2_key}\n"
         f"positions(top)={len(top_pos)} | positions(contractAccount)={len(ca_pos)}\n"
-        f"scan:{', '.join(any_pos_paths) or '<none>'}"
+        f"scan:{', '.join(scan_paths) or '<none>'}"
     )
-    _post_text(msg)
+
 
 
 # ========= MAIN LOOP =========
