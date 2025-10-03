@@ -1,7 +1,7 @@
-# main.py — ApeX Omni → Discord (forward-only, multi-endpoint probe)
-# - Probes several endpoints to find open positions.
-# - Forwards only what the API returns (mark/PNL fields show "-" if absent).
-# - Robust signature, timestamp auto-flip, raw/base64 secret auto-detect.
+# main.py — ApeX Omni → Discord (forward-only, deep discovery)
+# - Probes multiple endpoints, then deeply inspects /v3/account to discover where positions live.
+# - On DEBUG=1 posts a "payload map" of all array paths under /v3/account.
+# - Forwards positions (no computed PnL) once discovered.
 
 import os
 import time
@@ -10,7 +10,7 @@ import hmac
 import hashlib
 import base64
 import logging
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any, Optional, Set
 
 import requests
 from urllib3.util.retry import Retry
@@ -38,35 +38,37 @@ PNL_DEC = int(os.getenv("PNL_DECIMALS", "4"))
 PNL_PCT_DEC = int(os.getenv("PNL_PCT_DECIMALS", "2"))
 
 DEBUG_ON = (os.getenv("DEBUG", "").strip().lower() in ("1", "true", "yes", "y"))
-
-ACCOUNT_ID = os.getenv("APEX_ACCOUNT_ID", "").strip()  # optional; we’ll try both accountId and account
+ACCOUNT_ID = os.getenv("APEX_ACCOUNT_ID", "").strip()  # optional; we will also mine ids dynamically
 
 STATE = {"ts_style": INIT_TS_STYLE}
 
 # ------------------------- LOGGING -------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s: %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 LOG = logging.getLogger("apex-forward")
 
 # ------------------------- HTTP -------------------------
 
 session = requests.Session()
 retry = Retry(
-    total=4,
-    connect=4,
-    read=6,
-    backoff_factor=0.6,
+    total=4, connect=4, read=6, backoff_factor=0.6,
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["GET", "POST"],
 )
 session.mount("https://", HTTPAdapter(max_retries=retry))
 session.mount("http://", HTTPAdapter(max_retries=retry))
-session.headers.update({"Accept": "application/json", "User-Agent": "apex-forward/1.2"})
+session.headers.update({"Accept": "application/json", "User-Agent": "apex-forward/1.3"})
 
-# ------------------------- UTILS -------------------------
+# ------------------------- HELPERS -------------------------
+
+def discord_post(text: str):
+    if not DISCORD_WEBHOOK:
+        LOG.error("DISCORD_WEBHOOK not set")
+        return
+    try:
+        session.post(DISCORD_WEBHOOK, json={"content": text[:1990]}, timeout=15)
+    except Exception as e:
+        LOG.error("Discord post failed: %s", e)
 
 def secret_bytes() -> bytes:
     s = (API_SECRET or "").strip()
@@ -74,7 +76,6 @@ def secret_bytes() -> bytes:
         return s.encode("utf-8")
     if SECRET_MODE == "base64":
         return base64.b64decode(s)
-    # auto-detect base64 strictly; else raw
     try:
         return base64.b64decode(s, validate=True)
     except Exception:
@@ -91,15 +92,6 @@ def sign(ts: str, method: str, path: str, body: str = "") -> str:
     digest = hmac.new(secret_bytes(), payload.encode("utf-8"), hashlib.sha256).digest()
     return base64.b64encode(digest).decode("utf-8")
 
-def discord_post(text: str):
-    if not DISCORD_WEBHOOK:
-        LOG.error("DISCORD_WEBHOOK not set")
-        return
-    try:
-        session.post(DISCORD_WEBHOOK, json={"content": text[:1990]}, timeout=15)
-    except Exception as e:
-        LOG.error("Discord post failed: %s", e)
-
 def safe_float(x: Any) -> float:
     try:
         return float(str(x))
@@ -113,10 +105,9 @@ def fmt_num(x: Any, dec: int) -> str:
     except Exception:
         return "-"
 
-# ------------------------- API -------------------------
+# ------------------------- API CORE -------------------------
 
 def signed_get(path: str) -> Dict[str, Any]:
-    """Signed GET with timestamp auto-flip on server timestamp error."""
     url = f"{BASE_URL}{path}"
 
     def call(ts_style: str) -> Tuple[Dict[str, Any], requests.Response]:
@@ -139,91 +130,93 @@ def signed_get(path: str) -> Dict[str, Any]:
     js, r = call(STATE["ts_style"])
     if js.get("code") == 20002 and "APEX-TIMESTAMP" in str(js.get("msg", "")):
         STATE["ts_style"] = "iso" if STATE["ts_style"] == "ms" else "ms"
-        LOG.warning("Timestamp rejected; flipping TS_STYLE to %s and retrying", STATE["ts_style"])
+        LOG.warning("Timestamp rejected; flipping TS_STYLE=%s", STATE["ts_style"])
         js, r = call(STATE["ts_style"])
 
     if r is not None:
         r.raise_for_status()
     return js
 
-def extract_positions(acct: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]]]:
-    """Discover positions in common and nested layouts."""
-    if not isinstance(acct, dict):
-        return "<bad-account>", []
+# ------------------------- DISCOVERY -------------------------
 
-    candidates = [
-        ("positions", acct.get("positions")),
-        ("contractAccount.positions", (acct.get("contractAccount") or {}).get("positions")),
-        ("data.positions", (acct.get("data") or {}).get("positions")),
-        ("data.contractAccount.positions",
-         ((acct.get("data") or {}).get("contractAccount") or {}).get("positions")),
-        ("account.contractAccount.positions",
-         ((acct.get("account") or {}).get("contractAccount") or {}).get("positions")),
-        ("result.positions", (acct.get("result") or {}).get("positions")),
-        ("data", acct.get("data")),  # sometimes data *is* the list
-        ("result", acct.get("result")),  # sometimes result *is* the list
-    ]
+def looks_like_position(d: Dict[str, Any]) -> bool:
+    k = set(d.keys())
+    if {"symbol", "size"} <= k:
+        return True
+    if {"market", "size"} <= k:
+        return True
+    if "entryPrice" in k or "avgEntryPrice" in k or "averageEntryPrice" in k:
+        if "symbol" in k or "market" in k:
+            return True
+    return False
 
-    for name, arr in candidates:
-        if isinstance(arr, list) and arr and isinstance(arr[0], dict):
-            return name, arr
-
-    # If top-level is a list of dicts, use it
-    if isinstance(acct, list) and acct and isinstance(acct[0], dict):
+def extract_positions(acct: Any) -> Tuple[str, List[Dict[str, Any]]]:
+    """Quick pass at common spots + root list detection."""
+    if isinstance(acct, dict):
+        candidates = [
+            ("positions", acct.get("positions")),
+            ("contractAccount.positions", (acct.get("contractAccount") or {}).get("positions")),
+            ("data.positions", (acct.get("data") or {}).get("positions")),
+            ("data.contractAccount.positions", ((acct.get("data") or {}).get("contractAccount") or {}).get("positions")),
+            ("account.contractAccount.positions", ((acct.get("account") or {}).get("contractAccount") or {}).get("positions")),
+            ("result.positions", (acct.get("result") or {}).get("positions")),
+            ("data", acct.get("data")),
+            ("result", acct.get("result")),
+        ]
+        for name, arr in candidates:
+            if isinstance(arr, list) and arr and isinstance(arr[0], dict) and looks_like_position(arr[0]):
+                return name, arr
+    if isinstance(acct, list) and acct and isinstance(acct[0], dict) and looks_like_position(acct[0]):
         return "<root-list>", acct  # type: ignore
-
-    # Deep scan as a last resort
-    def looks_like_position(d: Dict[str, Any]) -> bool:
-        k = set(d.keys())
-        return (
-            {"symbol", "size", "entryPrice"} <= k
-            or (("symbol" in k or "market" in k) and ("size" in k))
-        )
-
-    found: List[Dict[str, Any]] = []
-    def walk(x: Any):
-        if isinstance(x, list):
-            if x and isinstance(x[0], dict) and looks_like_position(x[0]):
-                found.extend(x)
-            else:
-                for v in x: walk(v)
-        elif isinstance(x, dict):
-            for v in x.values(): walk(v)
-
-    walk(acct)
-    if found:
-        return "<scan>", found
-
     return "<none>", []
 
-def probe_positions() -> Tuple[str, List[Dict[str, Any]]]:
-    """
-    Try multiple endpoints in order and return the first that yields positions.
-    Signing includes the exact query string (path must match signature).
-    """
+def map_arrays(obj: Any, prefix: str = "") -> List[str]:
+    """Return list of paths to arrays (with size) to understand payload shape."""
     paths: List[str] = []
+    if isinstance(obj, list):
+        paths.append(f"{prefix or '<root>'}  len={len(obj)}")
+        # Recurse a bit to show nested shapes
+        for i, v in enumerate(obj[:3]):
+            paths += map_arrays(v, f"{prefix}[{i}]")
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            newp = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, list):
+                paths.append(f"{newp}  len={len(v)}")
+                for i, vv in enumerate(v[:2]):
+                    if isinstance(vv, dict):
+                        paths.append(f"{newp}[{i}].keys={sorted(list(vv.keys()))[:8]}")
+            else:
+                paths += map_arrays(v, newp)
+    return paths
 
-    # Primary account (two param spellings tried)
-    paths.append("/v3/account")
+def mine_ids(obj: Any) -> Set[str]:
+    """Find any string/int fields that look like account/contract IDs."""
+    found: Set[str] = set()
+    def rec(x: Any):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if isinstance(v, (str, int)):
+                    ks = k.lower()
+                    vs = str(v)
+                    if any(t in ks for t in ["accountid", "contractaccountid", "subaccountid", "contractid"]):
+                        if vs.isdigit() or len(vs) > 8:
+                            found.add(vs)
+                else:
+                    rec(v)
+        elif isinstance(x, list):
+            for v in x: rec(v)
+    rec(obj)
+    return found
+
+def probe_positions() -> Tuple[str, List[Dict[str, Any]]]:
+    # First: /v3/account (three variants)
+    primary_paths = ["/v3/account"]
     if ACCOUNT_ID:
-        paths.append(f"/v3/account?accountId={ACCOUNT_ID}")
-        paths.append(f"/v3/account?account={ACCOUNT_ID}")
+        primary_paths += [f"/v3/account?accountId={ACCOUNT_ID}",
+                          f"/v3/account?account={ACCOUNT_ID}"]
 
-    # Explicit positions endpoints (varies by tenant)
-    if ACCOUNT_ID:
-        paths.append(f"/v3/account/positions?accountId={ACCOUNT_ID}")
-        paths.append(f"/v3/account/open-positions?accountId={ACCOUNT_ID}")
-        paths.append(f"/v1/account/positions?accountId={ACCOUNT_ID}")  # legacy v1
-    paths += [
-        "/v3/account/positions",
-        "/v3/account/open-positions",
-        "/v3/positions",
-        "/v3/position/open",
-        "/v1/account/positions",  # legacy v1 without accountId
-    ]
-
-    errors: List[str] = []
-    for p in paths:
+    for p in primary_paths:
         try:
             js = signed_get(p)
             where, pos = extract_positions(js)
@@ -231,27 +224,71 @@ def probe_positions() -> Tuple[str, List[Dict[str, Any]]]:
                 discord_post(f"debug: probe {p} -> {where} ({len(pos)})")
             if pos:
                 return f"{p} :: {where}", pos
-        except requests.HTTPError as e:
-            errors.append(f"{p} http={getattr(e.response,'status_code','?')}")
-        except Exception as e:
-            errors.append(f"{p} err={e}")
 
-    if DEBUG_ON and errors:
-        discord_post("debug: probe errors\n" + "\n".join(errors[:10]))
+            # No positions found — dump a compact array map so we can see structure
+            if DEBUG_ON:
+                arrs = map_arrays(js)
+                snippet = "\n".join(arrs[:25]) or "(no arrays found)"
+                discord_post("debug: /v3/account payload map\n" + snippet)
+
+            # Mine IDs from this payload and try ID-based endpoints
+            ids = list(mine_ids(js))
+            if DEBUG_ON and ids:
+                discord_post("debug: discovered IDs\n" + "\n".join(ids[:10]))
+
+            # Build ID-shaped endpoints to try if we found IDs
+            probe = []
+            for idv in ids:
+                probe += [
+                    f"/v3/account/{idv}/positions",
+                    f"/v3/contractAccount/{idv}/positions",
+                    f"/v3/contract-account/{idv}/positions",
+                    f"/v3/portfolio/{idv}/positions",
+                ]
+
+            # Also try generic explicit endpoints
+            generic = [
+                "/v3/account/positions", "/v3/account/open-positions",
+                "/v3/positions", "/v3/position/open",
+                "/v1/account/positions",
+            ]
+            paths = probe + generic
+            errors: List[str] = []
+            for path in paths:
+                try:
+                    js2 = signed_get(path)
+                    w2, pos2 = extract_positions(js2)
+                    if DEBUG_ON:
+                        discord_post(f"debug: probe {path} -> {w2} ({len(pos2)})")
+                    if pos2:
+                        return f"{path} :: {w2}", pos2
+                except requests.HTTPError as e:
+                    errors.append(f"{path} http={getattr(e.response,'status_code','?')}")
+                except Exception as e:
+                    errors.append(f"{path} err={e}")
+
+            if DEBUG_ON and errors:
+                discord_post("debug: probe errors\n" + "\n".join(errors[:12]))
+
+        except requests.HTTPError as e:
+            if DEBUG_ON:
+                discord_post(f"debug: {p} http={getattr(e.response,'status_code','?')} body={getattr(e.response,'text','')[:160]}")
+        except Exception as e:
+            if DEBUG_ON:
+                discord_post(f"debug: {p} err={e}")
+
     return "<none>", []
 
-# ------------------------- TABLE FORMAT -------------------------
+# ------------------------- TABLE -------------------------
 
 def build_table(positions: List[Dict[str, Any]]) -> str:
     title = "Active ApeX Positions"
     header = [
         ("SYMBOL", 12), ("SIDE", 6), ("SIZE", 10),
-        ("ENTRY", 12),  ("MARK", 12), ("PNL", 12), ("PNL%", 7),
+        ("ENTRY", 12), ("MARK", 12), ("PNL", 12), ("PNL%", 7),
     ]
     def row(cols): return "".join(str(v).ljust(w) for v, w in cols)
-
-    lines = [title, "```", row(header),
-             row([("-" * len(h), w) for h, w in header])]
+    lines = [title, "```", row(header), row([("-"*len(h), w) for h,w in header])]
 
     for p in positions:
         sym  = p.get("symbol") or p.get("market") or p.get("pair") or "-"
@@ -259,24 +296,17 @@ def build_table(positions: List[Dict[str, Any]]) -> str:
         size = fmt_num(p.get("size") or p.get("positionSize") or p.get("qty"), SIZE_DEC)
 
         entry = p.get("entryPrice") or p.get("avgEntryPrice") or p.get("averageEntryPrice")
-        entry = fmt_num(entry, PRICE_DEC) if entry is not None else "-"
-
-        mark = p.get("markPrice") or p.get("indexPrice") or p.get("currentPrice")
-        mark = fmt_num(mark, PRICE_DEC) if mark is not None else "-"
+        mark  = p.get("markPrice")  or p.get("indexPrice")    or p.get("currentPrice")
 
         pnl = p.get("unrealizedPnl") or p.get("uPnl") or p.get("pnl") or p.get("unRealizedPnl")
-        pnl = fmt_num(pnl, PNL_DEC) if pnl is not None else "-"
-
         pnl_pct = p.get("unrealizedPnlPct") or p.get("unrealizedPnlPercent") or p.get("pnlPct")
-        if pnl_pct is not None:
-            try: pnl_pct = f"{float(pnl_pct):.{PNL_PCT_DEC}f}"
-            except Exception: pnl_pct = "-"
-        else:
-            pnl_pct = "-"
 
         lines.append(row([
             (sym, 12), (side, 6), (size, 10),
-            (entry, 12), (mark, 12), (pnl, 12), (pnl_pct, 7),
+            (fmt_num(entry, PRICE_DEC) if entry is not None else "-", 12),
+            (fmt_num(mark, PRICE_DEC)  if mark  is not None else "-", 12),
+            (fmt_num(pnl, PNL_DEC)     if pnl   is not None else "-", 12),
+            (f"{float(pnl_pct):.{PNL_PCT_DEC}f}" if pnl_pct not in (None, "") else "-", 7),
         ]))
 
     if not positions:
@@ -299,7 +329,7 @@ def snapshot_signature(positions: List[Dict[str, Any]]) -> str:
     payload = json.dumps(flat, separators=(",", ":"))
     return base64.b64encode(hashlib.sha1(payload.encode("utf-8")).digest()).decode("utf-8")
 
-# ------------------------- MAIN LOOP -------------------------
+# ------------------------- LOOP -------------------------
 
 def main():
     if not (API_KEY and API_SECRET and API_PASSPHRASE and DISCORD_WEBHOOK):
