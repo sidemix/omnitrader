@@ -1,283 +1,246 @@
-# main.py — Omni -> Discord with external mark price + PnL
+# ApeX Omni → Discord (forward-only)
+# - Polls /v3/account and posts your open positions to Discord.
+# - Shows only what the API returns. If PnL/Mark aren’t in the payload,
+#   those cells are "–" (no external price calls).
+
 import os, time, hmac, hashlib, base64, json, logging
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple, Optional
 import requests
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 
-# ---------- Env ----------
-DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
-BASE_URL         = os.environ.get("APEX_BASE_URL", "https://omni.apex.exchange/api").rstrip("/")
-API_KEY          = os.environ.get("APEX_API_KEY", os.environ.get("APEX_KEY","")).strip()
-API_SECRET       = os.environ.get("APEX_API_SECRET", os.environ.get("APEX_SECRET","")).strip()
-API_PASSPHRASE   = os.environ.get("APEX_API_PASSPHRASE", os.environ.get("APEX_PASSPHRASE","")).strip()
+# ===== env =====
+API_KEY        = os.getenv("APEX_API_KEY") or os.getenv("APEX_KEY")
+API_SECRET     = os.getenv("APEX_API_SECRET") or os.getenv("APEX_SECRET")
+PASSPHRASE     = os.getenv("APEX_API_PASSPHRASE") or os.getenv("APEX_PASSPHRASE")
+DISCORD_WEBHOOK= os.getenv("DISCORD_WEBHOOK")
 
-INTERVAL_SECS    = int(os.environ.get("INTERVAL_SECONDS", "20"))
-POST_EMPTY_EVERY = int(os.environ.get("POST_EMPTY_EVERY_SECS", "0"))
+BASE_URL       = (os.getenv("APEX_BASE_URL") or "https://omni.apex.exchange/api").rstrip("/")
+POLL_SECS      = int(os.getenv("INTERVAL_SECONDS", "30"))
+UPDATE_MODE    = (os.getenv("UPDATE_MODE") or "on-change").lower()  # "on-change" | "always"
+TS_STYLE       = (os.getenv("APEX_TS_STYLE") or "iso").lower()       # "iso" | "ms"
+SECRET_IS_B64  = (os.getenv("APEX_SECRET_BASE64") or "0").strip() in ("1","true","True")
 
-PRICE_SOURCES    = [s.strip().lower() for s in os.environ.get("PRICE_SOURCES", "binance,gate,gecko").split(",") if s.strip()]
-BINANCE_MAP      = os.environ.get("BINANCE_MAP", "")
-GATE_MAP         = os.environ.get("GATE_MAP", "")
-GECKO_MAP        = os.environ.get("GECKO_MAP", "")
+SIZE_DEC       = int(os.getenv("SIZE_DECIMALS", "4"))
+PRICE_DEC      = int(os.getenv("PRICE_DECIMALS", "4"))
+PNL_DEC        = int(os.getenv("PNL_DECIMALS", "4"))
+PNL_PCT_DEC    = int(os.getenv("PNL_PCT_DECIMALS", "2"))
 
-PRICE_DECIMALS   = int(os.environ.get("PRICE_DECIMALS", "4"))
-SIZE_DECIMALS    = int(os.environ.get("SIZE_DECIMALS", "4"))
-PNL_DECIMALS     = int(os.environ.get("PNL_DECIMALS", "4"))
-PNL_PCT_DECIMALS = int(os.environ.get("PNL_PCT_DECIMALS", "2"))
+# ===== logging =====
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s"
+)
 
-UPDATE_MODE      = os.environ.get("UPDATE_MODE", "any_change")  # any_change | positions_only
+def _fmt(x, n):
+    try:
+        f = float(x)
+    except Exception:
+        return "–"
+    return f"{f:.{n}f}"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-
+# ===== HTTP session with retries =====
 session = requests.Session()
-session.headers.update({"Accept": "application/json"})
+retry = Retry(total=4, connect=4, read=6, backoff_factor=0.7,
+              status_forcelist=[429,500,502,503,504], allowed_methods=["GET","POST"])
+session.mount("https://", HTTPAdapter(max_retries=retry))
+session.mount("http://",  HTTPAdapter(max_retries=retry))
 
-# ---------- Helpers ----------
-def _now_ms() -> int:
-    return int(time.time() * 1000)
+def _timestamp():
+    if TS_STYLE == "ms":
+        return str(int(time.time() * 1000))
+    # ISO8601 with Z
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
-def _b64_hmac_sha256(secret: str, msg: str) -> str:
-    sig = hmac.new(secret.encode(), msg.encode(), hashlib.sha256).digest()
+def _key_bytes():
+    if SECRET_IS_B64:
+        return base64.b64decode(API_SECRET)
+    return API_SECRET.encode()
+
+def _sign(ts, method, path, body=""):
+    payload = f"{ts}{method.upper()}{path}{body}"
+    sig = hmac.new(_key_bytes(), payload.encode(), hashlib.sha256).digest()
     return base64.b64encode(sig).decode()
 
-def _sign_v3(secret: str, ts_ms: int, method: str, path: str, query: str, body: str) -> str:
-    # ApeX v3: timestamp + method + path(+query) + body
-    request_path = path + (f"?{query}" if query else "")
-    raw = f"{ts_ms}{method.upper()}{request_path}{body}"
-    return _b64_hmac_sha256(secret, raw)
-
-def headers_v3(method: str, path: str, query: str = "", body: str = "") -> Dict[str, str]:
-    ts_ms = _now_ms()
-    sign = _sign_v3(API_SECRET, ts_ms, method, path, query, body)
+def _headers(path, method="GET", body=""):
+    ts = _timestamp()
     return {
-        "Content-Type": "application/json",
         "APEX-KEY": API_KEY,
-        "APEX-PASSPHRASE": API_PASSPHRASE,
-        "APEX-TIMESTAMP": str(ts_ms),
-        "APEX-SIGN": sign,
+        "APEX-PASSPHRASE": PASSPHRASE,
+        "APEX-TIMESTAMP": ts,
+        "APEX-SIGNATURE": _sign(ts, method, path, body),
+        "Content-Type": "application/json",
     }
 
-def post_to_discord(text: str):
-    if not DISCORD_WEBHOOK:
-        logging.warning("No DISCORD_WEBHOOK set")
-        return
+def _req_json(path):
+    # Try once; if timestamp error, flip style and retry
+    url = f"{BASE_URL}{path}"
+    h = _headers(path, "GET", "")
+    r = session.get(url, headers=h, timeout=15)
     try:
-        session.post(DISCORD_WEBHOOK, json={"content": text}, timeout=10)
-    except Exception as e:
-        logging.warning(f"Discord post failed: {e}")
-
-def chunks(lines: List[str], n: int = 40) -> List[List[str]]:
-    return [lines[i:i+n] for i in range(0, len(lines), n)]
-
-def parse_map(env_val: str, sep: str = ";") -> Dict[str, str]:
-    out = {}
-    for item in filter(None, [p.strip() for p in env_val.replace(",", sep).split(sep)]):
-        if "=" in item:
-            k, v = item.split("=", 1)
-            out[k.strip()] = v.strip()
-    return out
-
-BINANCE_SYM_MAP = parse_map(BINANCE_MAP)
-GATE_SYM_MAP    = parse_map(GATE_MAP)
-GECKO_ID_MAP    = parse_map(GECKO_MAP)
-
-# ---------- Positions ----------
-def get_account() -> Dict:
-    # v3 account (private)
-    path = "/v3/account"
-    url  = f"{BASE_URL}{path}"
-    hdrs = headers_v3("GET", path)
-    r = session.get(url, headers=hdrs, timeout=10)
-    r.raise_for_status()
-    return r.json()
-
-def extract_positions(obj) -> List[Dict]:
-    """
-    Walk the account payload and collect any array of dicts
-    that look like positions: must have symbol, size, entryPrice
-    """
-    found: List[Dict] = []
-
-    def walk(x):
-        if isinstance(x, dict):
-            # looks like a position item
-            if {"symbol", "size", "entryPrice"} <= set(x.keys()):
-                found.append(x)
-            for v in x.values():
-                walk(v)
-        elif isinstance(x, list):
-            for v in x:
-                walk(v)
-
-    walk(obj)
-    # filter size>0
-    return [p for p in found if safe_float(p.get("size")) > 0]
-
-def safe_float(x) -> float:
-    try:
-        return float(x)
-    except:
-        return 0.0
-
-# ---------- Price sources ----------
-def fetch_binance(symbols: List[str]) -> Dict[str, float]:
-    out = {}
-    for sym in symbols:
-        q = BINANCE_SYM_MAP.get(sym, sym.replace("-", ""))
-        try:
-            r = session.get("https://api.binance.com/api/v3/ticker/price",
-                            params={"symbol": q}, timeout=6)
-            if r.status_code == 200:
-                price = safe_float(r.json().get("price"))
-                if price > 0:
-                    out[sym] = price
-        except Exception:
-            pass
-    return out
-
-def fetch_gate(symbols: List[str]) -> Dict[str, float]:
-    out = {}
-    for sym in symbols:
-        q = GATE_SYM_MAP.get(sym, sym.replace("-", "_"))
-        try:
-            r = session.get("https://api.gateio.ws/api/v4/spot/tickers",
-                            params={"currency_pair": q}, timeout=6)
-            if r.status_code == 200:
-                arr = r.json()
-                if isinstance(arr, list) and arr:
-                    last = safe_float(arr[0].get("last"))
-                    if last > 0:
-                        out[sym] = last
-        except Exception:
-            pass
-    return out
-
-def fetch_gecko(symbols: List[str]) -> Dict[str, float]:
-    # build id list from GECKO_MAP
-    ids = [GECKO_ID_MAP.get(s) for s in symbols if GECKO_ID_MAP.get(s)]
-    if not ids:
-        return {}
-    try:
-        r = session.get("https://api.coingecko.com/api/v3/simple/price",
-                        params={"ids": ",".join(ids), "vs_currencies": "usdt"}, timeout=8)
-        if r.status_code != 200:
-            return {}
-        data = r.json()
-        rev = {v: k for k, v in GECKO_ID_MAP.items()}
-        out = {}
-        for gecko_id, obj in data.items():
-            usdt = safe_float(obj.get("usdt"))
-            if usdt > 0 and gecko_id in rev:
-                out[rev[gecko_id]] = usdt
-        return out
+        j = r.json()
     except Exception:
+        r.raise_for_status()
         return {}
+    if isinstance(j, dict):
+        # Omni error code pattern
+        if j.get("code") == 20002 and "APEX-TIMESTAMP" in (j.get("msg") or ""):
+            # flip style (ms <-> iso) and retry once
+            global TS_STYLE
+            TS_STYLE = "ms" if TS_STYLE == "iso" else "iso"
+            logging.warning("Timestamp rejected; flipped TS_STYLE to %s and retrying", TS_STYLE)
+            h = _headers(path, "GET", "")
+            r = session.get(url, headers=h, timeout=15)
+            try:
+                j = r.json()
+            except Exception:
+                r.raise_for_status()
+                return {}
+    return j
 
-def get_marks(symbols: List[str]) -> Dict[str, float]:
-    remaining = set(symbols)
-    marks: Dict[str, float] = {}
+def get_positions():
+    """
+    Fetch account data and extract open positions.
+    We look through several commonly used layouts:
+    - data.contractAccount.positions
+    - account.contractAccount.positions
+    - positions
+    """
+    j = _req_json("/v3/account")
+    if not isinstance(j, dict):
+        return []
 
-    for source in PRICE_SOURCES:
-        if not remaining:
-            break
+    # Drill down variants
+    n = j
+    for key in ("data", "account"):
+        if isinstance(n, dict) and key in n:
+            n = n[key]
+    if isinstance(n, dict) and "contractAccount" in n:
+        n = n["contractAccount"]
+    if isinstance(n, dict):
+        positions = n.get("positions") or []
+    else:
+        positions = j.get("positions") or []
+
+    # Filter to “open size > 0”
+    out = []
+    for p in positions:
+        size = p.get("size") or p.get("positionSize") or p.get("qty") or 0
         try:
-            if source == "binance":
-                got = fetch_binance(list(remaining))
-            elif source == "gate":
-                got = fetch_gate(list(remaining))
-            elif source == "gecko":
-                got = fetch_gecko(list(remaining))
-            else:
-                got = {}
+            if float(size) <= 0:
+                continue
         except Exception:
-            got = {}
-        for k, v in got.items():
-            if k in remaining and v > 0:
-                marks[k] = v
-        remaining -= set(got.keys())
+            continue
+        out.append(p)
+    return out
 
-    if remaining:
-        logging.info(f"Missing marks for: {', '.join(sorted(remaining))}")
-    return marks
+def _first_field(d, *names, default="–"):
+    for name in names:
+        if name in d and d[name] not in (None, "", 0, "0"):
+            return d[name]
+    return default
 
-# ---------- Formatting ----------
-def fmt(x: Optional[float], dec: int) -> str:
-    if x is None:
-        return "-"
-    return f"{x:.{dec}f}"
+def build_table(positions):
+    # columns: SYMBOL | SIDE | SIZE | ENTRY | MARK | PNL | PNL%
+    lines = []
+    head = [
+        ("SYMBOL",  12),
+        ("SIDE",     6),
+        ("SIZE",    10),
+        ("ENTRY",   12),
+        ("MARK",    12),
+        ("PNL",     12),
+        ("PNL%",     6),
+    ]
+    def row(cols):
+        return "".join(str(col).ljust(w) for col, w in cols)
 
-def build_table(positions: List[Dict], marks: Dict[str, float]) -> str:
-    # headers
-    rows = []
-    rows.append("**Active ApeX Positions**")
-    header = f"{'SYMBOL':<10} {'SIDE':<6} {'SIZE':>8} {'ENTRY':>12} {'MARK':>12} {'PNL':>12} {'PNL%':>8}"
-    sep    = f"{'-'*10} {'-'*6} {'-'*8} {'-'*12} {'-'*12} {'-'*12} {'-'*8}"
-    rows.extend([f"```", header, sep])
+    lines.append("Active ApeX Positions")
+    lines.append("```")
+    lines.append(row([(h,w) for h,w in head]))
+    lines.append(row([("".ljust(len(h), "-"), w) for h,w in head]))
 
     for p in positions:
-        sym   = p.get("symbol")
-        side  = (p.get("side") or "").upper()
-        size  = safe_float(p.get("size"))
-        entry = safe_float(p.get("entryPrice"))
-        mark  = marks.get(sym)
-        pnl = pnl_pct = None
-        if mark:
-            sgn = 1.0 if side == "LONG" else -1.0
-            pnl = sgn * (mark - entry) * size
-            pnl_pct = sgn * ((mark - entry) / entry * 100.0) if entry else None
+        symbol = _first_field(p, "symbol", "market", "pair", "instrument", default="–")
+        side   = _first_field(p, "side", "positionSide", default="–")
+        size   = _fmt(_first_field(p, "size", "positionSize", "qty", default=None), SIZE_DEC)
 
-        rows.append(
-            f"{sym:<10} "
-            f"{(side or '-'): <6} "
-            f"{fmt(size, SIZE_DECIMALS):>8} "
-            f"{fmt(entry, PRICE_DECIMALS):>12} "
-            f"{fmt(mark, PRICE_DECIMALS):>12} "
-            f"{fmt(pnl, PNL_DECIMALS):>12} "
-            f"{(fmt(pnl_pct, PNL_PCT_DECIMALS) if pnl_pct is not None else '-'):>8}"
-        )
+        entry  = _first_field(p, "entryPrice", "avgEntryPrice", "averageEntryPrice", default=None)
+        entry  = _fmt(entry, PRICE_DEC) if entry is not None else "–"
 
-    rows.append("```")
-    return "\n".join(rows)
+        # These may or may not exist in the payload. If missing, show "–".
+        mark   = _first_field(p, "markPrice", "indexPrice", "currentPrice", default=None)
+        mark   = _fmt(mark, PRICE_DEC) if mark is not None else "–"
 
-# ---------- Main loop ----------
+        pnl    = _first_field(p, "unrealizedPnl", "uPnl", "pnl", "unRealizedPnl", default=None)
+        pnl    = _fmt(pnl, PNL_DEC) if pnl is not None else "–"
+
+        pnlpct = _first_field(p, "unrealizedPnlPct", "pnlPct", default=None)
+        pnlpct = (f"{float(pnlpct):.{PNL_PCT_DEC}f}" if pnlpct not in (None, "–") else "–")
+
+        lines.append(row([
+            (symbol, 12),
+            (side,    6),
+            (size,   10),
+            (entry,  12),
+            (mark,   12),
+            (pnl,    12),
+            (pnlpct,  6),
+        ]))
+
+    if not positions:
+        lines.append("(no open positions)")
+    lines.append("```")
+    return "\n".join(lines)
+
+def post_to_discord(text):
+    if not DISCORD_WEBHOOK:
+        logging.error("DISCORD_WEBHOOK missing")
+        return
+    try:
+        r = session.post(DISCORD_WEBHOOK, json={"content": text}, timeout=15)
+        if r.status_code >= 300:
+            logging.error("Discord post failed: %s %s", r.status_code, r.text[:200])
+    except Exception as e:
+        logging.error("Discord post error: %s", e)
+
+def hash_snapshot(positions):
+    """Create a small signature of what we display to avoid repost spam."""
+    key_fields = []
+    for p in positions:
+        key_fields.append((
+            _first_field(p, "symbol", "market", "pair", "instrument", default="–"),
+            _first_field(p, "side", "positionSide", default="–"),
+            str(_first_field(p, "size", "positionSize", "qty", default="0")),
+            str(_first_field(p, "entryPrice", "avgEntryPrice", "averageEntryPrice", default="0")),
+            str(_first_field(p, "markPrice", "indexPrice", "currentPrice", default="")),
+            str(_first_field(p, "unrealizedPnl", "uPnl", "pnl", "unRealizedPnl", default="")),
+            str(_first_field(p, "unrealizedPnlPct", "pnlPct", default="")),
+        ))
+    payload = json.dumps(key_fields, separators=(",",":"))
+    return hashlib.sha1(payload.encode()).hexdigest()
+
 def main():
-    last_payload = None
-    last_post_empty = 0
+    if not (API_KEY and API_SECRET and PASSPHRASE and DISCORD_WEBHOOK):
+        logging.error("Missing one or more envs: APEX_API_KEY, APEX_API_SECRET, APEX_API_PASSPHRASE, DISCORD_WEBHOOK")
+        return
 
+    logging.info("Forward-only bridge online. Base=%s  TS_STYLE=%s", BASE_URL, TS_STYLE)
+    last_sig = ""
     while True:
         try:
-            acct = get_account()
-            positions = extract_positions(acct)
-
-            # symbols we need marks for
-            symbols = sorted({p.get("symbol") for p in positions if safe_float(p.get("size")) > 0})
-            marks = get_marks(symbols) if symbols else {}
-
-            table = build_table(positions, marks)
-
-            should_post = False
-            if UPDATE_MODE == "positions_only":
-                shape = [(p.get("symbol"), p.get("side"), p.get("size"), p.get("entryPrice")) for p in positions]
-                if shape != last_payload:
-                    should_post = True
-                    last_payload = shape
+            positions = get_positions()
+            sig = hash_snapshot(positions)
+            if UPDATE_MODE == "always" or sig != last_sig:
+                msg = build_table(positions)
+                post_to_discord(msg)
+                last_sig = sig
+                logging.info("Posted %d positions", len(positions))
             else:
-                if table != last_payload:
-                    should_post = True
-                    last_payload = table
-
-            if positions or (POST_EMPTY_EVERY > 0 and time.time() - last_post_empty >= POST_EMPTY_EVERY):
-                if should_post:
-                    post_to_discord(table)
-                if not positions:
-                    last_post_empty = time.time()
-
-        except requests.HTTPError as e:
-            logging.error(f"HTTP error: {e.response.status_code} {e.response.text[:200]}")
+                logging.info("No position change")
         except Exception as e:
-            logging.error(f"Poll error: {e}")
-
-        time.sleep(INTERVAL_SECS)
+            logging.error("Poll error: %s", e)
+        time.sleep(POLL_SECS)
 
 if __name__ == "__main__":
-    logging.info(f"Starting (BASE_URL={BASE_URL}) | price sources={PRICE_SOURCES}")
     main()
