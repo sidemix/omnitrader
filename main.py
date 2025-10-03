@@ -1,7 +1,6 @@
-# main.py — ApeX Omni → Discord (forward-only, deep discovery)
-# - Probes multiple endpoints, then deeply inspects /v3/account to discover where positions live.
-# - On DEBUG=1 posts a "payload map" of all array paths under /v3/account.
-# - Forwards positions (no computed PnL) once discovered.
+# main.py — ApeX Omni → Discord (forward-only, forced discovery diag on first run)
+# Posts a one-time /v3/account "payload map" to Discord so we can lock the correct positions path.
+# Then forwards open positions (no custom PnL math). Auto-toggles timestamp style if needed.
 
 import os
 import time
@@ -38,7 +37,10 @@ PNL_DEC = int(os.getenv("PNL_DECIMALS", "4"))
 PNL_PCT_DEC = int(os.getenv("PNL_PCT_DECIMALS", "2"))
 
 DEBUG_ON = (os.getenv("DEBUG", "").strip().lower() in ("1", "true", "yes", "y"))
-ACCOUNT_ID = os.getenv("APEX_ACCOUNT_ID", "").strip()  # optional; we will also mine ids dynamically
+ACCOUNT_ID = os.getenv("APEX_ACCOUNT_ID", "").strip()  # optional
+
+# Force one-time diagnostics to Discord on first loop (even if DEBUG is off)
+FORCE_STARTUP_DIAG = True
 
 STATE = {"ts_style": INIT_TS_STYLE}
 
@@ -57,7 +59,7 @@ retry = Retry(
 )
 session.mount("https://", HTTPAdapter(max_retries=retry))
 session.mount("http://", HTTPAdapter(max_retries=retry))
-session.headers.update({"Accept": "application/json", "User-Agent": "apex-forward/1.3"})
+session.headers.update({"Accept": "application/json", "User-Agent": "apex-forward/1.4"})
 
 # ------------------------- HELPERS -------------------------
 
@@ -145,13 +147,11 @@ def looks_like_position(d: Dict[str, Any]) -> bool:
         return True
     if {"market", "size"} <= k:
         return True
-    if "entryPrice" in k or "avgEntryPrice" in k or "averageEntryPrice" in k:
-        if "symbol" in k or "market" in k:
-            return True
+    if ("entryPrice" in k or "avgEntryPrice" in k or "averageEntryPrice" in k) and ("symbol" in k or "market" in k):
+        return True
     return False
 
 def extract_positions(acct: Any) -> Tuple[str, List[Dict[str, Any]]]:
-    """Quick pass at common spots + root list detection."""
     if isinstance(acct, dict):
         candidates = [
             ("positions", acct.get("positions")),
@@ -171,11 +171,9 @@ def extract_positions(acct: Any) -> Tuple[str, List[Dict[str, Any]]]:
     return "<none>", []
 
 def map_arrays(obj: Any, prefix: str = "") -> List[str]:
-    """Return list of paths to arrays (with size) to understand payload shape."""
     paths: List[str] = []
     if isinstance(obj, list):
         paths.append(f"{prefix or '<root>'}  len={len(obj)}")
-        # Recurse a bit to show nested shapes
         for i, v in enumerate(obj[:3]):
             paths += map_arrays(v, f"{prefix}[{i}]")
     elif isinstance(obj, dict):
@@ -191,7 +189,6 @@ def map_arrays(obj: Any, prefix: str = "") -> List[str]:
     return paths
 
 def mine_ids(obj: Any) -> Set[str]:
-    """Find any string/int fields that look like account/contract IDs."""
     found: Set[str] = set()
     def rec(x: Any):
         if isinstance(x, dict):
@@ -209,8 +206,11 @@ def mine_ids(obj: Any) -> Set[str]:
     rec(obj)
     return found
 
+_DIAG_POSTED = False  # one-time payload map + probe report
+
 def probe_positions() -> Tuple[str, List[Dict[str, Any]]]:
-    # First: /v3/account (three variants)
+    global _DIAG_POSTED
+
     primary_paths = ["/v3/account"]
     if ACCOUNT_ID:
         primary_paths += [f"/v3/account?accountId={ACCOUNT_ID}",
@@ -220,62 +220,63 @@ def probe_positions() -> Tuple[str, List[Dict[str, Any]]]:
         try:
             js = signed_get(p)
             where, pos = extract_positions(js)
-            if DEBUG_ON:
-                discord_post(f"debug: probe {p} -> {where} ({len(pos)})")
-            if pos:
-                return f"{p} :: {where}", pos
 
-            # No positions found — dump a compact array map so we can see structure
-            if DEBUG_ON:
+            if FORCE_STARTUP_DIAG and not _DIAG_POSTED:
                 arrs = map_arrays(js)
                 snippet = "\n".join(arrs[:25]) or "(no arrays found)"
-                discord_post("debug: /v3/account payload map\n" + snippet)
+                discord_post(f"diag: /v3/account payload map\n{snippet}")
 
-            # Mine IDs from this payload and try ID-based endpoints
+            if pos:
+                if FORCE_STARTUP_DIAG and not _DIAG_POSTED:
+                    discord_post(f"diag: probe {p} -> {where} ({len(pos)})")
+                    _DIAG_POSTED = True
+                return f"{p} :: {where}", pos
+
+            # Mine IDs from payload and try ID-shaped endpoints
             ids = list(mine_ids(js))
-            if DEBUG_ON and ids:
-                discord_post("debug: discovered IDs\n" + "\n".join(ids[:10]))
-
-            # Build ID-shaped endpoints to try if we found IDs
-            probe = []
+            paths = []
             for idv in ids:
-                probe += [
+                paths += [
                     f"/v3/account/{idv}/positions",
                     f"/v3/contractAccount/{idv}/positions",
                     f"/v3/contract-account/{idv}/positions",
                     f"/v3/portfolio/{idv}/positions",
                 ]
-
-            # Also try generic explicit endpoints
-            generic = [
+            # Generic guesses
+            paths += [
                 "/v3/account/positions", "/v3/account/open-positions",
                 "/v3/positions", "/v3/position/open",
                 "/v1/account/positions",
             ]
-            paths = probe + generic
+
             errors: List[str] = []
             for path in paths:
                 try:
                     js2 = signed_get(path)
                     w2, pos2 = extract_positions(js2)
-                    if DEBUG_ON:
-                        discord_post(f"debug: probe {path} -> {w2} ({len(pos2)})")
                     if pos2:
+                        if FORCE_STARTUP_DIAG and not _DIAG_POSTED:
+                            discord_post(f"diag: probe {path} -> {w2} ({len(pos2)})")
+                            _DIAG_POSTED = True
                         return f"{path} :: {w2}", pos2
                 except requests.HTTPError as e:
                     errors.append(f"{path} http={getattr(e.response,'status_code','?')}")
                 except Exception as e:
                     errors.append(f"{path} err={e}")
 
-            if DEBUG_ON and errors:
-                discord_post("debug: probe errors\n" + "\n".join(errors[:12]))
+            if FORCE_STARTUP_DIAG and not _DIAG_POSTED:
+                msg = "diag: probe errors\n" + ("\n".join(errors[:12]) if errors else "(none)")
+                discord_post(msg)
+                _DIAG_POSTED = True
 
         except requests.HTTPError as e:
-            if DEBUG_ON:
-                discord_post(f"debug: {p} http={getattr(e.response,'status_code','?')} body={getattr(e.response,'text','')[:160]}")
+            if FORCE_STARTUP_DIAG and not _DIAG_POSTED:
+                discord_post(f"diag: {p} http={getattr(e.response,'status_code','?')} body={getattr(e.response,'text','')[:160]}")
+                _DIAG_POSTED = True
         except Exception as e:
-            if DEBUG_ON:
-                discord_post(f"debug: {p} err={e}")
+            if FORCE_STARTUP_DIAG and not _DIAG_POSTED:
+                discord_post(f"diag: {p} err={e}")
+                _DIAG_POSTED = True
 
     return "<none>", []
 
@@ -346,18 +347,11 @@ def main():
         try:
             where, raw = probe_positions()
 
-            if DEBUG_ON:
-                discord_post(f"debug: found {len(raw)} positions at {where}")
-
-            # min-size filter
             positions = []
             for p in raw:
                 sz = safe_float(p.get("size") or p.get("positionSize") or p.get("qty"))
                 if sz >= MIN_POS_SIZE:
                     positions.append(p)
-
-            if DEBUG_ON:
-                discord_post(f"debug: after min_size={MIN_POS_SIZE}: {len(positions)} remain")
 
             table = build_table(positions)
             sig = snapshot_signature(positions)
