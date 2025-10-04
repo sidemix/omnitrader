@@ -1,6 +1,10 @@
-# main.py — ApeX Omni → Discord (forward-only, forced discovery diag on first run)
-# Posts a one-time /v3/account "payload map" to Discord so we can lock the correct positions path.
-# Then forwards open positions (no custom PnL math). Auto-toggles timestamp style if needed.
+# main.py — ApeX Omni → Discord (forward-only, robust discovery)
+# - Probes /v3/account AND /v3/user, mines IDs, and tries many ID-specific endpoints.
+# - One-time payload maps + endpoint probe report always posted on first run.
+# - Optional overrides:
+#     APEX_POSITIONS_ENDPOINT=/v3/contractAccount/<id>/positions
+#     APEX_POSITIONS_JSONPATH=data.positions
+# - No custom PnL math; just forwards whatever Omni returns.
 
 import os
 import time
@@ -39,7 +43,11 @@ PNL_PCT_DEC = int(os.getenv("PNL_PCT_DECIMALS", "2"))
 DEBUG_ON = (os.getenv("DEBUG", "").strip().lower() in ("1", "true", "yes", "y"))
 ACCOUNT_ID = os.getenv("APEX_ACCOUNT_ID", "").strip()  # optional
 
-# Force one-time diagnostics to Discord on first loop (even if DEBUG is off)
+# Optional hard overrides (skip probing)
+OVERRIDE_ENDPOINT = (os.getenv("APEX_POSITIONS_ENDPOINT") or "").strip()
+OVERRIDE_JSONPATH = (os.getenv("APEX_POSITIONS_JSONPATH") or "").strip()
+
+# Always post startup diagnostics (payload maps + probe results)
 FORCE_STARTUP_DIAG = True
 
 STATE = {"ts_style": INIT_TS_STYLE}
@@ -59,7 +67,7 @@ retry = Retry(
 )
 session.mount("https://", HTTPAdapter(max_retries=retry))
 session.mount("http://", HTTPAdapter(max_retries=retry))
-session.headers.update({"Accept": "application/json", "User-Agent": "apex-forward/1.4"})
+session.headers.update({"Accept": "application/json", "User-Agent": "apex-forward/1.6"})
 
 # ------------------------- HELPERS -------------------------
 
@@ -78,6 +86,7 @@ def secret_bytes() -> bytes:
         return s.encode("utf-8")
     if SECRET_MODE == "base64":
         return base64.b64decode(s)
+    # auto
     try:
         return base64.b64decode(s, validate=True)
     except Exception:
@@ -130,6 +139,7 @@ def signed_get(path: str) -> Dict[str, Any]:
         return (js if isinstance(js, dict) else {}), r
 
     js, r = call(STATE["ts_style"])
+    # Flip ts-style if server says timestamp invalid
     if js.get("code") == 20002 and "APEX-TIMESTAMP" in str(js.get("msg", "")):
         STATE["ts_style"] = "iso" if STATE["ts_style"] == "ms" else "ms"
         LOG.warning("Timestamp rejected; flipping TS_STYLE=%s", STATE["ts_style"])
@@ -140,6 +150,18 @@ def signed_get(path: str) -> Dict[str, Any]:
     return js
 
 # ------------------------- DISCOVERY -------------------------
+
+def json_path_get(obj: Any, path: str) -> Any:
+    """Very small dot-path walker: 'data.positions' or 'result.list'."""
+    if not path:
+        return obj
+    cur = obj
+    for part in path.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return None
+    return cur
 
 def looks_like_position(d: Dict[str, Any]) -> bool:
     k = set(d.keys())
@@ -196,7 +218,7 @@ def mine_ids(obj: Any) -> Set[str]:
                 if isinstance(v, (str, int)):
                     ks = k.lower()
                     vs = str(v)
-                    if any(t in ks for t in ["accountid", "contractaccountid", "subaccountid", "contractid"]):
+                    if any(t in ks for t in ["accountid", "contractaccountid", "subaccountid", "portfolioid", "contractid"]):
                         if vs.isdigit() or len(vs) > 8:
                             found.add(vs)
                 else:
@@ -206,77 +228,116 @@ def mine_ids(obj: Any) -> Set[str]:
     rec(obj)
     return found
 
-_DIAG_POSTED = False  # one-time payload map + probe report
+_DIAG_POSTED = False  # one-time diagnostics guard
+
+def post_payload_map(label: str, js: Any):
+    arrs = map_arrays(js)
+    snippet = "\n".join(arrs[:35]) or "(no arrays found)"
+    discord_post(f"diag: {label} payload map\n{snippet}")
 
 def probe_positions() -> Tuple[str, List[Dict[str, Any]]]:
     global _DIAG_POSTED
 
-    primary_paths = ["/v3/account"]
-    if ACCOUNT_ID:
-        primary_paths += [f"/v3/account?accountId={ACCOUNT_ID}",
-                          f"/v3/account?account={ACCOUNT_ID}"]
-
-    for p in primary_paths:
+    # If user supplied override, try it first (no probing).
+    if OVERRIDE_ENDPOINT:
         try:
-            js = signed_get(p)
-            where, pos = extract_positions(js)
-
-            if FORCE_STARTUP_DIAG and not _DIAG_POSTED:
-                arrs = map_arrays(js)
-                snippet = "\n".join(arrs[:25]) or "(no arrays found)"
-                discord_post(f"diag: /v3/account payload map\n{snippet}")
-
+            js = signed_get(OVERRIDE_ENDPOINT)
+            node = json_path_get(js, OVERRIDE_JSONPATH) if OVERRIDE_JSONPATH else js
+            where, pos = extract_positions(node)
             if pos:
                 if FORCE_STARTUP_DIAG and not _DIAG_POSTED:
-                    discord_post(f"diag: probe {p} -> {where} ({len(pos)})")
+                    discord_post(f"diag: override {OVERRIDE_ENDPOINT} -> {OVERRIDE_JSONPATH or '<root>'} ({len(pos)})")
                     _DIAG_POSTED = True
-                return f"{p} :: {where}", pos
-
-            # Mine IDs from payload and try ID-shaped endpoints
-            ids = list(mine_ids(js))
-            paths = []
-            for idv in ids:
-                paths += [
-                    f"/v3/account/{idv}/positions",
-                    f"/v3/contractAccount/{idv}/positions",
-                    f"/v3/contract-account/{idv}/positions",
-                    f"/v3/portfolio/{idv}/positions",
-                ]
-            # Generic guesses
-            paths += [
-                "/v3/account/positions", "/v3/account/open-positions",
-                "/v3/positions", "/v3/position/open",
-                "/v1/account/positions",
-            ]
-
-            errors: List[str] = []
-            for path in paths:
-                try:
-                    js2 = signed_get(path)
-                    w2, pos2 = extract_positions(js2)
-                    if pos2:
-                        if FORCE_STARTUP_DIAG and not _DIAG_POSTED:
-                            discord_post(f"diag: probe {path} -> {w2} ({len(pos2)})")
-                            _DIAG_POSTED = True
-                        return f"{path} :: {w2}", pos2
-                except requests.HTTPError as e:
-                    errors.append(f"{path} http={getattr(e.response,'status_code','?')}")
-                except Exception as e:
-                    errors.append(f"{path} err={e}")
-
-            if FORCE_STARTUP_DIAG and not _DIAG_POSTED:
-                msg = "diag: probe errors\n" + ("\n".join(errors[:12]) if errors else "(none)")
-                discord_post(msg)
-                _DIAG_POSTED = True
-
-        except requests.HTTPError as e:
-            if FORCE_STARTUP_DIAG and not _DIAG_POSTED:
-                discord_post(f"diag: {p} http={getattr(e.response,'status_code','?')} body={getattr(e.response,'text','')[:160]}")
-                _DIAG_POSTED = True
+                return f"{OVERRIDE_ENDPOINT} :: {OVERRIDE_JSONPATH or '<root>'}", pos
+            else:
+                if FORCE_STARTUP_DIAG and not _DIAG_POSTED:
+                    discord_post(f"diag: override returned no positions (path={OVERRIDE_JSONPATH or '<root>'})")
+                    _DIAG_POSTED = True
         except Exception as e:
             if FORCE_STARTUP_DIAG and not _DIAG_POSTED:
-                discord_post(f"diag: {p} err={e}")
+                discord_post(f"diag: override error {e}")
                 _DIAG_POSTED = True
+
+    # 1) Fetch /v3/account and /v3/user; post payload maps; mine ids.
+    ids: Set[str] = set()
+    roots: List[Tuple[str, Dict[str, Any]]] = []
+
+    for label, path in [("(/v3/account)", "/v3/account"), ("(/v3/user)", "/v3/user")]:
+        try:
+            js = signed_get(path)
+            roots.append((path, js))
+            ids |= mine_ids(js)
+            if FORCE_STARTUP_DIAG and not _DIAG_POSTED:
+                post_payload_map(label, js)
+        except requests.HTTPError as e:
+            if FORCE_STARTUP_DIAG and not _DIAG_POSTED:
+                discord_post(f"diag: {path} http={getattr(e.response,'status_code','?')} body={getattr(e.response,'text','')[:140]}")
+        except Exception as e:
+            if FORCE_STARTUP_DIAG and not _DIAG_POSTED:
+                discord_post(f"diag: {path} err={e}")
+
+    # Try direct extraction from roots (sometimes positions live under /v3/user)
+    for path, js in roots:
+        where, pos = extract_positions(js)
+        if pos:
+            if FORCE_STARTUP_DIAG and not _DIAG_POSTED:
+                discord_post(f"diag: probe {path} -> {where} ({len(pos)})")
+                _DIAG_POSTED = True
+            return f"{path} :: {where}", pos
+
+    # Also add explicit ACCOUNT_ID if provided
+    if ACCOUNT_ID:
+        ids.add(ACCOUNT_ID)
+
+    # 2) Build ID-specific and generic guesses to probe.
+    endpoints: List[str] = []
+
+    # With IDs
+    for idv in list(ids)[:8]:
+        endpoints += [
+            f"/v3/account/{idv}",
+            f"/v3/account/{idv}/positions",
+            f"/v3/contractAccount/{idv}",
+            f"/v3/contractAccount/{idv}/positions",
+            f"/v3/portfolio/{idv}/positions",
+        ]
+
+    # If tenant exposes user- or private-scoped lists
+    endpoints += [
+        "/v3/user/positions",
+        "/v3/user/open-positions",
+        "/v3/private/positions",
+        "/v3/private/account/positions",
+        "/v3/positions/open",
+        "/v3/position/list",
+        "/v3/position/open",
+        "/v1/account/positions",
+        "/v3/account/positions",
+        "/v3/account/open-positions",
+        "/v3/positions",
+    ]
+
+    errors: List[str] = []
+    for ep in endpoints:
+        try:
+            js = signed_get(ep)
+            # If user gave JSONPATH override, honor it here too
+            node = json_path_get(js, OVERRIDE_JSONPATH) if OVERRIDE_JSONPATH else js
+            where, pos = extract_positions(node)
+            if pos:
+                if FORCE_STARTUP_DIAG and not _DIAG_POSTED:
+                    discord_post(f"diag: probe {ep} -> {where} ({len(pos)})")
+                    _DIAG_POSTED = True
+                return f"{ep} :: {where}", pos
+        except requests.HTTPError as e:
+            errors.append(f"{ep} http={getattr(e.response,'status_code','?')}")
+        except Exception as e:
+            errors.append(f"{ep} err={e}")
+
+    if FORCE_STARTUP_DIAG and not _DIAG_POSTED:
+        msg = "diag: probe errors\n" + ("\n".join(errors[:20]) if errors else "(none)")
+        discord_post(msg)
+        _DIAG_POSTED = True
 
     return "<none>", []
 
