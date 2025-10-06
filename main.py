@@ -26,6 +26,51 @@ from typing import Dict, Any, List, Optional
 
 import aiohttp
 
+# ========= ENV LOADING + MASKED DIAGNOSTICS (must be near top) =========
+import os, logging
+
+def _mask(v: str) -> str:
+    if not v:
+        return "<missing>"
+    v = v.strip()
+    if len(v) <= 8:
+        return f"<set len={len(v)}>"
+    return f"{v[:4]}...{v[-4:]} (len={len(v)})"
+
+def _get_any(*names: str):
+    """
+    Return the first non-empty env value (stripped) among the provided names.
+    Logs each candidate so we can see exactly what the process receives.
+    """
+    chosen = None
+    for n in names:
+        raw = os.getenv(n)
+        logging.info(f"ENV {n} = {_mask(raw)}")
+        if (raw or "").strip() and chosen is None:
+            chosen = (raw or "").strip()
+    return chosen
+
+# Accept both short and legacy names
+APEX_KEY        = _get_any("APEX_KEY", "APEX_API_KEY")
+APEX_SECRET     = _get_any("APEX_SECRET", "APEX_API_SECRET")
+APEX_PASSPHRASE = _get_any("APEX_PASSPHRASE", "APEX_API_PASSPHRASE", "APEX_API_KEY_PASSPHRASE")
+
+APEX_TS_STYLE   = (_get_any("APEX_TS_STYLE") or "ms").lower()
+APEX_BASE_URL   = _get_any("APEX_BASE_URL") or "https://omni.apex.exchange/api"
+APEX_SECRET_B64 = (_get_any("APEX_SECRET_BASE64") or "").lower() in ("1","true","yes","on")
+
+if not (APEX_KEY and APEX_SECRET and APEX_PASSPHRASE):
+    logging.warning("No API credentials set; private WS may not authorize.")
+else:
+    logging.info("API creds present ✓ (masked above)")
+
+# Extra: show all APEX_* names present so you can catch duplicates/overrides
+_present = [k for k in os.environ.keys() if k.startswith("APEX_")]
+logging.info(f"APEX_* present: {', '.join(sorted(_present)) or '(none)'}")
+logging.info(f"Using BASE_URL={APEX_BASE_URL}  TS_STYLE={APEX_TS_STYLE}  SECRET_B64={APEX_SECRET_B64}")
+# ======================================================================
+
+
 # ---------- config & logging ---------- 
 
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
