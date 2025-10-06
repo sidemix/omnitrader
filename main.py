@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ApeX Omni → Discord (WebSocket-first, live PnL)
 # - Private WS: account topics (positions) with explicit login signing
-# - Public WS : generic + per-symbol ticker subscriptions
+# - Public WS : generic + per-symbol ticker subscriptions (broad probe set)
 # PnL:
 #   LONG : (mark - entry) * size
 #   SHORT: (entry - mark) * size
@@ -109,6 +109,7 @@ class TickerBook:
         self._mark: Dict[str, Decimal] = {}
         self._last: Dict[str, Decimal] = {}
         self._first_seen: Set[str] = set()
+        self._miss_count: Dict[str, int] = {}
 
     def _D(self, x) -> Optional[Decimal]:
         try:
@@ -116,56 +117,84 @@ class TickerBook:
         except Exception:
             return None
 
+    def _update_item(self, item: Dict[str, Any]):
+        sym = (item.get("s") or item.get("symbol") or item.get("contract") or item.get("instId"))
+        if not sym:
+            return
+        sym = str(sym).upper().replace("/", "-")
+
+        # Broader set of aliases for mark/last
+        mark = self._D(
+            item.get("mp") or item.get("markPrice") or item.get("indexPrice")
+            or item.get("markPx") or item.get("idxPx")
+        )
+        last = self._D(
+            item.get("p") or item.get("last") or item.get("lastPrice")
+            or item.get("close") or item.get("px") or item.get("tradePx")
+        )
+
+        if mark is not None:
+            self._mark[sym] = mark
+        if last is not None:
+            self._last[sym] = last
+
+        if sym not in self._first_seen and (mark is not None or last is not None):
+            self._first_seen.add(sym)
+            logging.info("Public price live for %s (mark=%s last=%s)", sym, mark, last)
+
+        if DEBUG:
+            logging.debug("public %s mark=%s last=%s", sym, mark, last)
+
     def update_from_public(self, payload: Dict[str, Any]) -> None:
         """
         Handles shapes like:
           {topic, contents:[{s:'APEXUSDT', mp:'1.23', p:'1.24', ...}]}
           {topic, data:[{...}]}
           {topic, data:{data:[...]}}   # some gateways nest twice
+          {arg:{channel:'tickers',instId:'APEX-USDT'}, data:[{last:'..', markPx:'..'}]} (OKX-ish)
         """
-        def update_item(item: Dict[str, Any]):
-            sym = (item.get("s") or item.get("symbol") or item.get("contract") or item.get("instId"))
-            if not sym:
-                return
-            sym = str(sym).upper().replace("/", "-")
-
-            # Broader set of aliases for mark/last
-            mark = self._D(
-                item.get("mp") or item.get("markPrice") or item.get("indexPrice")
-                or item.get("markPx") or item.get("idxPx")
-            )
-            last = self._D(
-                item.get("p") or item.get("last") or item.get("lastPrice")
-                or item.get("close") or item.get("px") or item.get("tradePx")
-            )
-
-            if mark is not None:
-                self._mark[sym] = mark
-            if last is not None:
-                self._last[sym] = last
-
-            if sym not in self._first_seen and (mark is not None or last is not None):
-                self._first_seen.add(sym)
-                logging.info("Public price live for %s (mark=%s last=%s)", sym, mark, last)
-
-            if DEBUG:
-                logging.debug("public %s mark=%s last=%s", sym, mark, last)
-
-        # Try multiple locations
-        for key in ("contents", "data"):
-            obj = payload.get(key)
-            if isinstance(obj, list):
-                for it in obj:
+        # 1) contents
+        obj = payload.get("contents")
+        if isinstance(obj, list):
+            for it in obj:
+                if isinstance(it, dict):
+                    self._update_item(it)
+        elif isinstance(obj, dict):
+            inner = obj.get("data")
+            if isinstance(inner, list):
+                for it in inner:
                     if isinstance(it, dict):
-                        update_item(it)
-            elif isinstance(obj, dict):
-                inner = obj.get("data")
-                if isinstance(inner, list):
-                    for it in inner:
-                        if isinstance(it, dict):
-                            update_item(it)
-                else:
-                    update_item(obj)
+                        self._update_item(it)
+            else:
+                self._update_item(obj)
+
+        # 2) data (flat list or nested)
+        obj = payload.get("data")
+        if isinstance(obj, list):
+            for it in obj:
+                if isinstance(it, dict):
+                    self._update_item(it)
+        elif isinstance(obj, dict):
+            inner = obj.get("data")
+            if isinstance(inner, list):
+                for it in inner:
+                    if isinstance(it, dict):
+                        self._update_item(it)
+            else:
+                # Some feeds set symbol fields directly under "data"
+                # Try update if it looks item-like
+                if any(k in obj for k in ("s","symbol","instId","contract")):
+                    self._update_item(obj)
+
+        # 3) okx-style: {"arg": {...}, "data": [...]}
+        if isinstance(payload.get("arg"), dict) and isinstance(payload.get("data"), list):
+            for it in payload["data"]:
+                if isinstance(it, dict):
+                    # attach instId if data items omit symbol
+                    if "s" not in it and "symbol" not in it and "contract" not in it and "instId" not in it:
+                        it = dict(it)
+                        it["instId"] = payload["arg"].get("instId") or payload["arg"].get("symbol")
+                    self._update_item(it)
 
     def mark_or_last(self, sym: str) -> Optional[Decimal]:
         for v in _symbol_variants(sym):
@@ -174,6 +203,11 @@ class TickerBook:
         for v in _symbol_variants(sym):
             if v in self._last:
                 return self._last[v]
+        # track misses for visibility
+        c = self._miss_count.get(sym, 0) + 1
+        self._miss_count[sym] = c
+        if c in (1, 5, 15, 30):
+            logging.info("Waiting for public price: %s (miss=%d)", sym, c)
         return None
 
 # ---------- positions ----------
@@ -191,7 +225,9 @@ class PositionBook:
             has_side  = any(k in keys for k in ("side","direction"))
             has_size  = any(k in keys for k in ("size","qty","positionqty"))
             has_entry = any(k in keys for k in ("entryprice","avgentryprice","avgprice","price"))
-            return has_sym and has_side and has_size and has_entry
+            # accept if pnl-like present even when entry missing (we'll show pnl directly)
+            has_pnl   = any(k in keys for k in ("unrealizedpnl","unrealizedprofit","pnl","upnl","u_pnl"))
+            return (has_sym and has_side and has_size and (has_entry or has_pnl))
 
         def D(x) -> Optional[Decimal]:
             try:
@@ -200,17 +236,38 @@ class PositionBook:
                 return None
 
         def normalize(d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            sym = d.get("symbol") or d.get("contract") or d.get("instId") or d.get("s")
+            sym  = d.get("symbol") or d.get("contract") or d.get("instId") or d.get("s")
             side = (d.get("side") or d.get("direction") or "").upper()
             size = d.get("size") or d.get("qty") or d.get("positionQty")
             entry= d.get("entryPrice") or d.get("avgEntryPrice") or d.get("avgPrice") or d.get("price")
+
+            # pnl-like fields if present
+            pnl_fields = [
+                "unrealizedPnl", "unrealizedPNL", "unrealizedProfit",
+                "uPnl", "uPNL", "pnl"
+            ]
+            upnl_val = None
+            for k in pnl_fields:
+                if k in d:
+                    upnl_val = D(d.get(k))
+                    break
+
             if not sym or side not in ("LONG","SHORT"):
                 return None
-            sizeD, entryD = D(size), D(entry)
-            if sizeD is None or entryD is None or sizeD == 0:
+            sizeD = D(size)
+            entryD = D(entry) if entry is not None else None
+
+            # Filter zero exposure
+            if sizeD is None or sizeD == 0:
                 return None
+
             sym = str(sym).upper().replace("/", "-")
-            return {"symbol": sym, "side": side, "size": sizeD, "entry": entryD}
+            out = {"symbol": sym, "side": side, "size": sizeD}
+            if entryD is not None:
+                out["entry"] = entryD
+            if upnl_val is not None:
+                out["pnlFromFeed"] = upnl_val  # used if mark not available
+            return out
 
         def walk(node: Any):
             nonlocal found
@@ -234,11 +291,25 @@ class PositionBook:
 
     def compute_pnl(self, prices: TickerBook) -> None:
         for p in self._pos.values():
-            sym, entry, size, side = p["symbol"], p["entry"], p["size"], p["side"]
+            sym  = p["symbol"]
+            size = p["size"]
+            side = p["side"]
+            entry = p.get("entry")
+
             mark = prices.mark_or_last(sym)
-            if mark is None:
+
+            if mark is None and "pnlFromFeed" in p:
+                # We have uPnL but no mark yet
+                p["mark"] = None
+                p["pnl"] = p["pnlFromFeed"]
+                notional = abs((entry or Decimal("0")) * size) if entry else None
+                p["pnlPct"] = (p["pnl"] / notional * Decimal("100")) if (notional and notional != 0) else None
+                continue
+
+            if mark is None or entry is None:
                 p["mark"] = p["pnl"] = p["pnlPct"] = None
                 continue
+
             pnl = (mark - entry) * size if side == "LONG" else (entry - mark) * size
             notional = abs(entry * size)
             pnlpct = (pnl / notional * Decimal("100")) if notional != 0 else None
@@ -260,7 +331,7 @@ async def post_discord(session: aiohttp.ClientSession, rows: List[Dict[str, Any]
         sym   = p["symbol"].ljust(10)
         side  = p["side"].ljust(4)
         size  = _fmt_num(p["size"], SIZE_DECIMALS).rjust(8)
-        entry = _fmt_num(p["entry"], PRICE_DECIMALS).rjust(11)
+        entry = _fmt_num(p.get("entry"), PRICE_DECIMALS).rjust(11)
         mark  = _fmt_num(p.get("mark"), PRICE_DECIMALS).rjust(11)
         pnl   = _fmt_num(p.get("pnl"),  PNL_DECIMALS).rjust(11)
         pct   = _fmt_num(p.get("pnlPct"), PNL_PCT_DECIMALS).rjust(9)
@@ -288,6 +359,11 @@ class PublicWS:
         "tickers_v1",
         "ws_omni_mark_price_v1",
         "ws_mark_price_v1",
+        # Gate-/OKX-ish channels (some gateways proxy these names)
+        "market.tickers",
+        "futures.tickers",
+        "perp.tickers",
+        "swap.tickers",
     ]
 
     def __init__(self, url: str, prices: TickerBook):
@@ -317,12 +393,26 @@ class PublicWS:
     async def _subscribe_symbol_variants(self, ws, sym: str):
         core = sym.replace("-", "")
         frames = [
+            # Our default topic name with inline symbol
             {"op":"subscribe","args":[f"{PUBLIC_TICKER_TOPIC}:{sym}"]},
             {"op":"subscribe","args":[f"{PUBLIC_TICKER_TOPIC}:{core}"]},
+
+            # Object-form with channel+symbol
             {"op":"subscribe","args":[{"channel": PUBLIC_TICKER_TOPIC, "symbol": sym}]},
             {"op":"subscribe","args":[{"channel": PUBLIC_TICKER_TOPIC, "symbol": core}]},
+
+            # Common alternates
             {"op":"subscribe","args":[{"channel": "ws_tickers_v1", "symbol": sym}]},
             {"op":"subscribe","args":[{"channel": "ws_tickers_v1", "symbol": core}]},
+
+            # OKX-ish
+            {"op":"subscribe","args":[{"channel": "tickers", "instId": sym}]},
+            {"op":"subscribe","args":[{"channel": "market.tickers", "instId": sym}]},
+
+            # Gate-ish
+            {"op":"subscribe","args":[{"channel": "futures.tickers", "contract": sym}]},
+            {"op":"subscribe","args":[{"channel": "perp.tickers", "contract": sym}]},
+            {"op":"subscribe","args":[{"channel": "swap.tickers", "contract": sym}]},
         ]
         for f in frames:
             try:
@@ -345,7 +435,7 @@ class PublicWS:
                         # Subscribe to generic topics
                         await self._subscribe_generic(ws)
 
-                        # NEW: subscribe per-symbol immediately on connect
+                        # Subscribe per symbol immediately on connect
                         if SUBSCRIBE_PER_SYMBOL and self._wanted_symbols:
                             for s in sorted(self._wanted_symbols):
                                 if s not in self._subscribed_symbols:
@@ -356,7 +446,7 @@ class PublicWS:
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 if ECHO_PUBLIC:
-                                    logging.info("PUB RAW: %s", msg.data[:500])
+                                    logging.info("PUB RAW: %s", msg.data[:800])
                                 try:
                                     payload = json.loads(msg.data)
                                     self.prices.update_from_public(payload)
@@ -364,7 +454,7 @@ class PublicWS:
                                     if DEBUG:
                                         logging.debug("public parse err: %s", msg.data[:200])
 
-                                # Also attempt late per-symbol subs after first frames
+                                # Late per-symbol subs (in case symbols changed)
                                 if SUBSCRIBE_PER_SYMBOL and self._wanted_symbols:
                                     pending = [s for s in self._wanted_symbols if s not in self._subscribed_symbols]
                                     for s in pending:
@@ -470,7 +560,7 @@ class Bridge:
         serial = []
         for p in sorted(rows, key=lambda x: x["symbol"]):
             serial.append(
-                f'{p["symbol"]}|{p["side"]}|{p["size"]}|{p["entry"]}|{p.get("mark")}|{p.get("pnl")}|{p.get("pnlPct")}'
+                f'{p["symbol"]}|{p["side"]}|{p["size"]}|{p.get("entry")}|{p.get("mark")}|{p.get("pnl")}|{p.get("pnlPct")}'
             )
         return ";".join(serial)
 
@@ -481,15 +571,15 @@ class Bridge:
         async with aiohttp.ClientSession() as session:
             while True:
                 try:
-                    # 1) compute pnl from latest prices
+                    # compute pnl
                     self.positions.compute_pnl(self.prices)
                     rows = self.positions.list_positions()
 
-                    # 2) ask public WS to subscribe per-symbol for current universe
+                    # ensure per-symbol subs for current symbols
                     if SUBSCRIBE_PER_SYMBOL and rows:
                         self.public_ws.want_symbols({p["symbol"] for p in rows})
 
-                    # 3) post when snapshot changes
+                    # post when snapshot changes
                     snap = self._snapshot_str(rows)
                     if rows:
                         if snap != self._last_sent_snapshot:
