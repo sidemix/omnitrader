@@ -26,7 +26,7 @@ from typing import Dict, Any, List, Optional
 
 import aiohttp
 
-# ---------- config & logging ----------
+# ---------- config & logging ---------- 
 
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
 
