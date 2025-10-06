@@ -26,6 +26,12 @@ from typing import Dict, Any, List, Optional
 
 import aiohttp
 
+import os, logging
+for k in ("APEX_KEY","APEX_SECRET","APEX_PASSPHRASE"):
+    v = (os.getenv(k) or "").strip()
+    logging.warning("ENV %s present=%s len=%d", k, bool(v), len(v))
+
+
 # ========= ENV LOADING + MASKED DIAGNOSTICS (must be near top) =========
 import os, logging
 
